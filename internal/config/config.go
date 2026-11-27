@@ -19,7 +19,18 @@ const (
 	defaultWorkerCount         = 2
 	defaultWorkerPollInterval  = 500 * time.Millisecond
 	defaultWorkerLeaseDuration = 30 * time.Second
+	defaultLLMModel            = "gpt-4o-mini"
+	defaultLLMTimeout          = 30 * time.Second
 )
+
+// TriageLLMConfig holds optional LLM provider settings for asynchronous incident triage.
+// APIKey is sensitive and must never be logged.
+type TriageLLMConfig struct {
+	APIKey   string
+	Endpoint string
+	Model    string
+	Timeout  time.Duration
+}
 
 // WorkerConfig configures the durable asynchronous incident worker pool.
 type WorkerConfig struct {
@@ -36,13 +47,14 @@ type RateLimitConfig struct {
 	TrustedProxies []string
 }
 
-// Config contains only runtime settings. DatabaseURL is sensitive and must not be logged.
+// Config contains only runtime settings. DatabaseURL and TriageLLM.APIKey are sensitive and must not be logged.
 type Config struct {
 	DatabaseURL      string
 	HTTPAddr         string
 	RateLimit        RateLimitConfig
 	PreAuthRateLimit RateLimitConfig
 	Worker           WorkerConfig
+	TriageLLM        TriageLLMConfig
 }
 
 // Load reads configuration from the process environment.
@@ -156,6 +168,21 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		workerLease = parsedLease
 	}
 
+	llmAPIKey := strings.TrimSpace(getenv("SENTINEL_LLM_API_KEY"))
+	llmEndpoint := strings.TrimSpace(getenv("SENTINEL_LLM_ENDPOINT"))
+	llmModel := strings.TrimSpace(getenv("SENTINEL_LLM_MODEL"))
+	if llmModel == "" {
+		llmModel = defaultLLMModel
+	}
+	llmTimeout := defaultLLMTimeout
+	if val := strings.TrimSpace(getenv("SENTINEL_LLM_TIMEOUT")); val != "" {
+		parsedTimeout, err := time.ParseDuration(val)
+		if err != nil || parsedTimeout < time.Second || parsedTimeout > 2*time.Minute {
+			return Config{}, errors.New("SENTINEL_LLM_TIMEOUT must be a duration between 1s and 2m")
+		}
+		llmTimeout = parsedTimeout
+	}
+
 	return Config{
 		DatabaseURL: databaseURL,
 		HTTPAddr:    httpAddr,
@@ -175,6 +202,12 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			Count:         workerCount,
 			PollInterval:  workerPoll,
 			LeaseDuration: workerLease,
+		},
+		TriageLLM: TriageLLMConfig{
+			APIKey:   llmAPIKey,
+			Endpoint: llmEndpoint,
+			Model:    llmModel,
+			Timeout:  llmTimeout,
 		},
 	}, nil
 }

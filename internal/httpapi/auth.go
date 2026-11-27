@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"sentinel/internal/auth"
+	"sentinel/internal/metrics"
 )
 
 type requestIDContextKey struct{}
@@ -111,6 +112,12 @@ func AuthenticateMiddleware(verifier auth.CredentialVerifier) func(http.Handler)
 // RequireAuthMiddleware rejects unauthenticated or invalid-credential requests after
 // rate limiting has had the opportunity to throttle brute-force traffic.
 func RequireAuthMiddleware() func(http.Handler) http.Handler {
+	return RequireAuthMiddlewareWithMetrics(nil)
+}
+
+// RequireAuthMiddlewareWithMetrics rejects unauthenticated or invalid-credential requests
+// and records bounded-cardinality authentication failure metrics.
+func RequireAuthMiddlewareWithMetrics(m *metrics.SentinelMetrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if _, ok := auth.PrincipalFromContext(r.Context()); ok {
@@ -120,14 +127,30 @@ func RequireAuthMiddleware() func(http.Handler) http.Handler {
 
 			authErr := auth.AuthErrorFromContext(r.Context())
 			if errors.Is(authErr, auth.ErrVerifierUnavailable) {
+				if m != nil {
+					m.HTTPAuthFailures.Inc("unavailable")
+				}
 				writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "authentication service is temporarily unavailable")
 				return
 			}
 
 			w.Header().Set("WWW-Authenticate", `Bearer realm="sentinel"`)
 			if authErr != nil {
+				if m != nil {
+					switch {
+					case errors.Is(authErr, auth.ErrRevokedCredentials):
+						m.HTTPAuthFailures.Inc("revoked")
+					case errors.Is(authErr, auth.ErrExpiredCredentials):
+						m.HTTPAuthFailures.Inc("expired")
+					default:
+						m.HTTPAuthFailures.Inc("invalid")
+					}
+				}
 				writeError(w, http.StatusUnauthorized, "invalid_credentials", "credentials are invalid or revoked")
 				return
+			}
+			if m != nil {
+				m.HTTPAuthFailures.Inc("missing")
 			}
 			writeError(w, http.StatusUnauthorized, "unauthorized", "valid bearer credentials are required")
 		})

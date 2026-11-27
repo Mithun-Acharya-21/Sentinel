@@ -15,6 +15,7 @@ type MetricsSnapshot struct {
 	AvgProcessingMillis  float64 `json:"avg_processing_ms"`
 	ProcessedTotal       uint64  `json:"processed_total"`
 	StoreErrors          uint64  `json:"store_errors"`
+	WorkerPanics         uint64  `json:"worker_panics"`
 }
 
 // Metrics tracks thread-safe atomic counters for the worker engine.
@@ -29,6 +30,7 @@ type Metrics struct {
 	processingTotalNs    atomic.Uint64
 	processedTotal       atomic.Uint64
 	storeErrors          atomic.Uint64
+	workerPanics         atomic.Uint64
 }
 
 // Snapshot returns a point-in-time copy of worker metrics.
@@ -53,5 +55,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		AvgProcessingMillis:  avgMs,
 		ProcessedTotal:       count,
 		StoreErrors:          m.storeErrors.Load(),
+		WorkerPanics:         m.workerPanics.Load(),
 	}
 }

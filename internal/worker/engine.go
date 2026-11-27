@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"sentinel/internal/metrics"
 )
 
 const (
@@ -62,6 +64,7 @@ type Config struct {
 	RetryPolicy   RetryPolicy
 	Clock         func() time.Time
 	Logger        *slog.Logger
+	PromMetrics   *metrics.SentinelMetrics
 }
 
 // Engine polls for durable jobs, claims them with leases, executes them with bounded
@@ -73,6 +76,7 @@ type Engine struct {
 	clock     func() time.Time
 	logger    *slog.Logger
 	metrics   *Metrics
+	prom      *metrics.SentinelMetrics
 
 	mu         sync.Mutex
 	started    bool
@@ -109,14 +113,30 @@ func NewEngine(store JobStore, processor Processor, cfg Config) *Engine {
 		processor = NewDefaultIncidentProcessor(store)
 	}
 
-	return &Engine{
+	e := &Engine{
 		store:     store,
 		processor: processor,
 		cfg:       cfg,
 		clock:     cfg.Clock,
 		logger:    cfg.Logger,
 		metrics:   &Metrics{},
+		prom:      cfg.PromMetrics,
 	}
+
+	if e.prom != nil && e.store != nil {
+		e.prom.Registry.OnScrape(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if depth, err := e.store.QueueDepth(ctx); err == nil {
+				e.prom.WorkerQueueDepth.Set(float64(depth))
+			}
+			if age, err := e.store.OldestReadyJobAgeSeconds(ctx, e.clock().UTC()); err == nil {
+				e.prom.WorkerQueueOldestAge.Set(age)
+			}
+		})
+	}
+
+	return e
 }
 
 // Metrics returns a point-in-time snapshot of worker observability metrics.
@@ -181,6 +201,10 @@ func (e *Engine) Stop(ctx context.Context) error {
 
 func (e *Engine) runWorker(pollCtx, jobCtx context.Context, workerID string) {
 	defer e.wg.Done()
+	if e.prom != nil {
+		e.prom.WorkerActive.Inc()
+		defer e.prom.WorkerActive.Dec()
+	}
 
 	ticker := time.NewTicker(e.cfg.PollInterval)
 	defer ticker.Stop()
@@ -223,10 +247,17 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 			return false, nil
 		}
 		e.metrics.storeErrors.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerErrors.Inc("store")
+		}
 		return false, err
 	}
 	if claimed {
 		e.metrics.leaseRecoveries.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerLeaseReclamations.Inc()
+			e.prom.WorkerJobsClaimed.Inc()
+		}
 		e.logger.Warn("reclaimed expired job lease",
 			slog.String("worker_id", workerID),
 			slog.String("job_id", job.ID),
@@ -240,10 +271,16 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 				return false, nil
 			}
 			e.metrics.storeErrors.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerErrors.Inc("store")
+			}
 			return false, err
 		}
 		if !claimed {
 			return false, nil
+		}
+		if e.prom != nil {
+			e.prom.WorkerJobsClaimed.Inc()
 		}
 	}
 
@@ -255,29 +292,55 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 		failErr := e.store.Fail(jobCtx, job.ID, job.LeaseToken, "lease expired after max attempts", now, true, now)
 		if errors.Is(failErr, ErrLeaseLost) {
 			e.metrics.staleLeaseRejections.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerStaleLeaseRejections.Inc()
+			}
 			return true, nil
 		}
 		if failErr != nil {
 			e.metrics.storeErrors.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerErrors.Inc("store")
+			}
 			return true, failErr
 		}
 		e.metrics.jobsDeadLettered.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerJobsDeadLettered.Inc()
+		}
 		return true, nil
 	}
 
 	start := e.clock()
-	procErr := e.processor.Process(jobCtx, job)
+	procErr, panicked := e.runProcessorSafely(jobCtx, job)
 	duration := e.clock().Sub(start)
 	if duration > 0 {
 		e.metrics.processingTotalNs.Add(uint64(duration.Nanoseconds()))
+		if e.prom != nil {
+			e.prom.WorkerJobDuration.Observe(duration.Seconds())
+		}
 	}
 	e.metrics.processedTotal.Add(1)
+	if panicked {
+		e.metrics.workerPanics.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerErrors.Inc("panic")
+		}
+		e.logger.Error("worker panic recovered",
+			slog.String("worker_id", workerID),
+			slog.String("job_id", job.ID),
+			slog.String("error", sanitizeError(procErr)),
+		)
+	}
 
 	finishTime := e.clock().UTC()
 	if procErr == nil {
 		compErr := e.store.Complete(jobCtx, job.ID, job.LeaseToken, finishTime)
 		if errors.Is(compErr, ErrLeaseLost) {
 			e.metrics.staleLeaseRejections.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerStaleLeaseRejections.Inc()
+			}
 			e.logger.Warn("stale worker completion rejected",
 				slog.String("worker_id", workerID),
 				slog.String("job_id", job.ID),
@@ -286,9 +349,15 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 		}
 		if compErr != nil {
 			e.metrics.storeErrors.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerErrors.Inc("store")
+			}
 			return true, compErr
 		}
 		e.metrics.jobsCompleted.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerJobsCompleted.Inc()
+		}
 		e.logger.Info("incident job completed",
 			slog.String("worker_id", workerID),
 			slog.String("job_id", job.ID),
@@ -303,11 +372,17 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 		defer cancelRel()
 		if relErr := e.store.Release(relCtx, job.ID, job.LeaseToken, finishTime); relErr != nil && !errors.Is(relErr, ErrLeaseLost) {
 			e.metrics.storeErrors.Add(1)
+			if e.prom != nil {
+				e.prom.WorkerErrors.Inc("store")
+			}
 		}
 		return true, nil
 	}
 
 	e.metrics.jobsFailed.Add(1)
+	if e.prom != nil {
+		e.prom.WorkerJobsFailed.Inc()
+	}
 	deadLetter := !IsRetryable(procErr) || job.Attempts >= job.MaxAttempts
 	nextAvailableAt := finishTime
 	if !deadLetter {
@@ -317,6 +392,9 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 	failErr := e.store.Fail(jobCtx, job.ID, job.LeaseToken, sanitizeError(procErr), nextAvailableAt, deadLetter, finishTime)
 	if errors.Is(failErr, ErrLeaseLost) {
 		e.metrics.staleLeaseRejections.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerStaleLeaseRejections.Inc()
+		}
 		e.logger.Warn("stale worker failure update rejected",
 			slog.String("worker_id", workerID),
 			slog.String("job_id", job.ID),
@@ -325,11 +403,17 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 	}
 	if failErr != nil {
 		e.metrics.storeErrors.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerErrors.Inc("store")
+		}
 		return true, failErr
 	}
 
 	if deadLetter {
 		e.metrics.jobsDeadLettered.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerJobsDeadLettered.Inc()
+		}
 		e.logger.Error("incident job dead-lettered",
 			slog.String("worker_id", workerID),
 			slog.String("job_id", job.ID),
@@ -337,6 +421,9 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 		)
 	} else {
 		e.metrics.jobsRetried.Add(1)
+		if e.prom != nil {
+			e.prom.WorkerJobsRetried.Inc()
+		}
 		e.logger.Warn("incident job scheduled for retry",
 			slog.String("worker_id", workerID),
 			slog.String("job_id", job.ID),
@@ -345,6 +432,16 @@ func (e *Engine) ProcessOne(pollCtx, jobCtx context.Context, workerID string) (b
 		)
 	}
 	return true, nil
+}
+
+func (e *Engine) runProcessorSafely(ctx context.Context, job Job) (err error, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			err = fmt.Errorf("worker panic: %v", r)
+		}
+	}()
+	return e.processor.Process(ctx, job), false
 }
 
 func sanitizeError(err error) string {

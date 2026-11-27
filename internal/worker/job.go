@@ -49,4 +49,5 @@ type JobStore interface {
 	Release(ctx context.Context, jobID, leaseToken string, now time.Time) error
 	RecordEffect(ctx context.Context, idempotencyKey, jobID, tenantID, effectName, summary string) (alreadyExecuted bool, err error)
 	QueueDepth(ctx context.Context) (int64, error)
+	OldestReadyJobAgeSeconds(ctx context.Context, now time.Time) (float64, error)
 }

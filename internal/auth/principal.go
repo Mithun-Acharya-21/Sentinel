@@ -7,8 +7,10 @@ import (
 
 // Supported authorization scopes for Sentinel's incident API.
 const (
-	ScopeIncidentsRead  = "incidents:read"
-	ScopeIncidentsWrite = "incidents:write"
+	ScopeIncidentsRead    = "incidents:read"
+	ScopeIncidentsWrite   = "incidents:write"
+	ScopeIncidentsApprove = "incidents:approve"
+	ScopeIncidentsExecute = "incidents:execute"
 )
 
 // AuthMethodBearerAPIKey identifies credentials verified via opaque Bearer API keys.

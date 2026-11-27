@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sentinel/internal/incident"
+	"sentinel/internal/metrics"
 )
 
 const defaultMaxJobAttempts = 5
@@ -19,11 +20,17 @@ const defaultMaxJobAttempts = 5
 type Repository struct {
 	db          *sql.DB
 	jobsCreated atomic.Uint64
+	prom        *metrics.SentinelMetrics
 }
 
 // NewRepository creates an incident repository over an already configured database pool.
 func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
+}
+
+// SetMetrics attaches Prometheus-compatible DB operation metrics to this repository.
+func (r *Repository) SetMetrics(m *metrics.SentinelMetrics) {
+	r.prom = m
 }
 
 // JobsCreated returns the number of durable processing jobs created by this repository instance.
@@ -103,11 +110,14 @@ func (r *Repository) Get(ctx context.Context, tenantID, id string) (incident.Inc
 	if strings.TrimSpace(tenantID) == "" {
 		return incident.Incident{}, incident.ErrNotFound
 	}
+	start := time.Now()
 	query := `SELECT ` + incidentColumns + ` FROM incidents WHERE id = $1::uuid AND tenant_id = $2`
 	got, err := scanIncident(r.db.QueryRowContext(ctx, query, id, tenantID))
 	if errors.Is(err, sql.ErrNoRows) {
+		r.prom.ObserveDBOperation("incident_get", time.Since(start), nil)
 		return incident.Incident{}, incident.ErrNotFound
 	}
+	r.prom.ObserveDBOperation("incident_get", time.Since(start), err)
 	if err != nil {
 		return incident.Incident{}, storageError("get incident", err)
 	}

@@ -7,18 +7,25 @@ import (
 	"fmt"
 	"time"
 
+	"sentinel/internal/metrics"
 	"sentinel/internal/worker"
 )
 
 // JobRepository implements durable PostgreSQL-backed job claiming, leasing,
 // fencing, and idempotent side-effect tracking.
 type JobRepository struct {
-	db *sql.DB
+	db   *sql.DB
+	prom *metrics.SentinelMetrics
 }
 
 // NewJobRepository creates a JobRepository over an existing database pool.
 func NewJobRepository(db *sql.DB) *JobRepository {
 	return &JobRepository{db: db}
+}
+
+// SetMetrics attaches Prometheus-compatible DB operation metrics to this repository.
+func (r *JobRepository) SetMetrics(m *metrics.SentinelMetrics) {
+	r.prom = m
 }
 
 var _ worker.JobStore = (*JobRepository)(nil)
@@ -208,11 +215,33 @@ ON CONFLICT (idempotency_key) DO NOTHING`
 
 // QueueDepth returns the count of active/queued jobs (pending, failed, or processing).
 func (r *JobRepository) QueueDepth(ctx context.Context) (int64, error) {
+	start := time.Now()
 	var depth int64
-	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM incident_jobs WHERE status IN ('pending', 'failed', 'processing')`).Scan(&depth); err != nil {
+	err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM incident_jobs WHERE status IN ('pending', 'failed', 'processing')`).Scan(&depth)
+	r.prom.ObserveDBOperation("job_queue_depth", time.Since(start), err)
+	if err != nil {
 		return 0, fmt.Errorf("query queue depth: %w", err)
 	}
 	return depth, nil
+}
+
+// OldestReadyJobAgeSeconds returns the age in seconds of the oldest ready job, or 0 if none are waiting.
+func (r *JobRepository) OldestReadyJobAgeSeconds(ctx context.Context, now time.Time) (float64, error) {
+	start := time.Now()
+	var oldest sql.NullTime
+	err := r.db.QueryRowContext(ctx, `SELECT min(available_at) FROM incident_jobs WHERE status IN ('pending', 'failed') AND available_at <= $1`, now.UTC()).Scan(&oldest)
+	r.prom.ObserveDBOperation("job_oldest_age", time.Since(start), err)
+	if err != nil {
+		return 0, fmt.Errorf("query oldest ready job age: %w", err)
+	}
+	if !oldest.Valid {
+		return 0, nil
+	}
+	age := now.UTC().Sub(oldest.Time.UTC()).Seconds()
+	if age < 0 {
+		return 0, nil
+	}
+	return age, nil
 }
 
 func scanJob(row rowScanner) (worker.Job, error) {

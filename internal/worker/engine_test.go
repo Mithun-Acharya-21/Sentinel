@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"sentinel/internal/metrics"
 )
 
 type memJobStore struct {
@@ -179,6 +181,21 @@ func (m *memJobStore) QueueDepth(_ context.Context) (int64, error) {
 		}
 	}
 	return count, nil
+}
+
+func (m *memJobStore) OldestReadyJobAgeSeconds(_ context.Context, now time.Time) (float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var maxAge float64
+	for _, j := range m.jobs {
+		if (j.Status == StatusPending || j.Status == StatusFailed) && !j.AvailableAt.After(now) {
+			age := now.Sub(j.AvailableAt).Seconds()
+			if age > maxAge {
+				maxAge = age
+			}
+		}
+	}
+	return maxAge, nil
 }
 
 type funcProcessor struct {
@@ -421,5 +438,62 @@ func TestConcurrentWorkersClaimDisjointJobs(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("job %s processed %d times, want 1", id, count)
 		}
+	}
+}
+
+func TestWorkerPanicRecoveryAndPromMetrics(t *testing.T) {
+	now := time.Date(2026, 11, 27, 15, 0, 0, 0, time.UTC)
+	store := newMemJobStore()
+	jobID := store.AddPending("tenant-a", "inc-panic", 3, now.Add(-5*time.Second))
+
+	prom := metrics.NewSentinelMetrics()
+	var calls atomic.Int32
+	proc := funcProcessor{fn: func(_ context.Context, _ Job) error {
+		if calls.Add(1) == 1 {
+			panic("nil pointer dereference in external adapter")
+		}
+		return nil
+	}}
+
+	engine := NewEngine(store, proc, Config{
+		WorkerCount:   1,
+		LeaseDuration: 30 * time.Second,
+		RetryPolicy: RetryPolicy{
+			MaxAttempts: 3,
+			BaseDelay:   1 * time.Second,
+			MaxDelay:    5 * time.Second,
+			RandFloat64: func() float64 { return 1.0 },
+		},
+		Clock:       func() time.Time { return now },
+		PromMetrics: prom,
+	})
+
+	// 1. First execution panics: worker must recover, record panic metric, and schedule retry
+	processed, err := engine.ProcessOne(context.Background(), context.Background(), "w1")
+	if err != nil || !processed {
+		t.Fatalf("ProcessOne after panic failed: processed=%v err=%v", processed, err)
+	}
+	if snap := engine.Metrics(); snap.WorkerPanics != 1 || snap.JobsRetried != 1 {
+		t.Fatalf("unexpected metrics after panic: %#v", snap)
+	}
+	if got := prom.WorkerErrors.Value("panic"); got != 1 {
+		t.Fatalf("prom WorkerErrors(panic) = %v, want 1", got)
+	}
+	if got := prom.WorkerJobsClaimed.Value(); got != 1 {
+		t.Fatalf("prom WorkerJobsClaimed = %v, want 1", got)
+	}
+
+	// 2. Advance past retry delay and re-run: succeeds without crashing worker
+	j := store.Get(jobID)
+	now = j.AvailableAt
+	processed, err = engine.ProcessOne(context.Background(), context.Background(), "w1")
+	if err != nil || !processed {
+		t.Fatalf("retry after panic failed: processed=%v err=%v", processed, err)
+	}
+	if got := store.Get(jobID); got.Status != StatusCompleted {
+		t.Fatalf("job status = %q, want completed", got.Status)
+	}
+	if got := prom.WorkerJobsCompleted.Value(); got != 1 {
+		t.Fatalf("prom WorkerJobsCompleted = %v, want 1", got)
 	}
 }

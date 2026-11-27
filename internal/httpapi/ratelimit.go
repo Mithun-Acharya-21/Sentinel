@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"sentinel/internal/auth"
+	"sentinel/internal/metrics"
 )
 
 // Default rate limiting configuration parameters.
@@ -47,6 +48,7 @@ type RateLimitConfig struct {
 	MaxBuckets      int
 	Clock           func() time.Time
 	TrustedProxies  []string
+	PromMetrics     *metrics.SentinelMetrics
 }
 
 // LimiterMetrics holds real-time telemetry on rate limiting decisions.
@@ -428,6 +430,9 @@ func PreAuthIPRateLimitMiddleware(ipLimiter *Limiter) func(http.Handler) http.Ha
 
 			clientKey := ipLimiter.ExtractPeerIPKey(r)
 			if allowed, wait := ipLimiter.Allow(clientKey); !allowed {
+				if ipLimiter.cfg.PromMetrics != nil {
+					ipLimiter.cfg.PromMetrics.HTTPRateLimitRejections.Inc("pre_auth_ip")
+				}
 				writeRateLimitExceeded(w, wait)
 				return
 			}
@@ -456,6 +461,9 @@ func AuthenticatedPrincipalRateLimitMiddleware(principalLimiter *Limiter) func(h
 			h := sha256.Sum256([]byte(principal.TenantID + ":" + principal.PrincipalID))
 			clientKey := "principal:" + hex.EncodeToString(h[:16])
 			if allowed, wait := principalLimiter.Allow(clientKey); !allowed {
+				if principalLimiter.cfg.PromMetrics != nil {
+					principalLimiter.cfg.PromMetrics.HTTPRateLimitRejections.Inc("principal")
+				}
 				writeRateLimitExceeded(w, wait)
 				return
 			}

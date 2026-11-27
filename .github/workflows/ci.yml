@@ -39,6 +39,7 @@ jobs:
           go build ./cmd/sentinel-api
           go build ./cmd/sentinel-admin
           go build ./cmd/sentinel-eval
+          go build ./cmd/sentinel-mock-llm
 
       - name: Run unit tests
         run: go test -count=1 ./...

@@ -10,6 +10,9 @@ import (
 
 	"sentinel/internal/auth"
 	"sentinel/internal/incident"
+	"sentinel/internal/metrics"
+	"sentinel/internal/remediation"
+	"sentinel/internal/triage"
 )
 
 const maxRequestBody = 1 << 20
@@ -18,6 +21,10 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-
 
 type API struct {
 	repository incident.Repository
+	triage     triage.Store
+	execStore  remediation.ExecutionStore
+	executor   *remediation.Executor
+	prom       *metrics.SentinelMetrics
 }
 
 type errorBody struct {
@@ -49,19 +56,27 @@ func NewProtectedHandler(repository incident.Repository, verifier auth.Credentia
 	return NewProtectedHandlerWithLimiters(repository, verifier, limiter, limiter)
 }
 
-// NewProtectedHandlerWithLimiters wraps the incident API with the exact security middleware chain:
-// 1. RequestMetadataMiddleware (request ID)
-// 2. PreAuthIPRateLimitMiddleware (Stage 1: peer IP throttling before credential verification)
-// 3. AuthenticateMiddleware (Bearer verification -> verified principal context)
-// 4. AuthenticatedPrincipalRateLimitMiddleware (Stage 2: verified principal quota)
-// 5. RequireAuthMiddleware (enforces 401/503 for unauthenticated requests)
-// 6. RequireScopeMiddleware + Incident handlers (scope enforcement + tenant-isolated repository ops)
+// NewProtectedHandlerWithLimiters wraps the incident API with the exact security middleware chain.
 func NewProtectedHandlerWithLimiters(repository incident.Repository, verifier auth.CredentialVerifier, preAuthIPLimiter, principalLimiter *Limiter) http.Handler {
+	return NewProtectedHandlerWithObservability(repository, verifier, preAuthIPLimiter, principalLimiter, nil)
+}
+
+// NewProtectedHandlerWithObservability wraps the incident API with the security middleware chain
+// and Prometheus-compatible HTTP metrics:
+// 1. RequestMetadataMiddleware (request ID)
+// 2. MetricsMiddleware (HTTP request count & duration)
+// 3. PreAuthIPRateLimitMiddleware (Stage 1: peer IP throttling before credential verification)
+// 4. AuthenticateMiddleware (Bearer verification -> verified principal context)
+// 5. AuthenticatedPrincipalRateLimitMiddleware (Stage 2: verified principal quota)
+// 6. RequireAuthMiddlewareWithMetrics (enforces 401/503 for unauthenticated requests)
+// 7. RequireScopeMiddleware + Incident handlers (scope enforcement + tenant-isolated repository ops)
+func NewProtectedHandlerWithObservability(repository incident.Repository, verifier auth.CredentialVerifier, preAuthIPLimiter, principalLimiter *Limiter, prom *metrics.SentinelMetrics) http.Handler {
 	handler := New(repository)
-	handler = RequireAuthMiddleware()(handler)
+	handler = RequireAuthMiddlewareWithMetrics(prom)(handler)
 	handler = AuthenticatedPrincipalRateLimitMiddleware(principalLimiter)(handler)
 	handler = AuthenticateMiddleware(verifier)(handler)
 	handler = PreAuthIPRateLimitMiddleware(preAuthIPLimiter)(handler)
+	handler = MetricsMiddleware(prom)(handler)
 	handler = RequestMetadataMiddleware()(handler)
 	return handler
 }

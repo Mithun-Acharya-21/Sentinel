@@ -13,8 +13,12 @@ import (
 
 	"sentinel/internal/auth"
 	"sentinel/internal/config"
+	"sentinel/internal/evaluation/llmagent"
 	"sentinel/internal/httpapi"
+	"sentinel/internal/metrics"
+	"sentinel/internal/remediation"
 	"sentinel/internal/storage/postgres"
+	"sentinel/internal/triage"
 	"sentinel/internal/worker"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -55,7 +59,19 @@ func run() error {
 		return errors.New("PostgreSQL startup check failed; verify SENTINEL_DATABASE_URL and database availability")
 	}
 
+	prom := metrics.NewSentinelMetrics()
+	prom.RegisterDBPool(database)
+
 	repository := postgres.NewRepository(database)
+	repository.SetMetrics(prom)
+	triageRepository := postgres.NewTriageRepository(database)
+	triageRepository.SetMetrics(prom)
+	remediationRepository := postgres.NewRemediationRepository(database)
+	remediationRepository.SetMetrics(prom)
+	simEnv := remediation.NewSimulator(nil)
+	remediationExecutor := remediation.NewExecutor(triageRepository, remediationRepository, simEnv, remediation.ExecutorConfig{
+		PromMetrics: prom,
+	})
 	credRepository := postgres.NewCredentialRepository(database)
 	verifier := auth.NewStoreVerifier(credRepository)
 
@@ -67,6 +83,7 @@ func run() error {
 		CleanupInterval: httpapi.DefaultCleanupInterval,
 		MaxBuckets:      httpapi.DefaultMaxBuckets,
 		TrustedProxies:  cfg.PreAuthRateLimit.TrustedProxies,
+		PromMetrics:     prom,
 	})
 	if err != nil {
 		return errors.New("could not configure pre-auth IP rate limiter")
@@ -81,16 +98,19 @@ func run() error {
 		CleanupInterval: httpapi.DefaultCleanupInterval,
 		MaxBuckets:      httpapi.DefaultMaxBuckets,
 		TrustedProxies:  cfg.RateLimit.TrustedProxies,
+		PromMetrics:     prom,
 	})
 	if err != nil {
 		return errors.New("could not configure principal rate limiter")
 	}
 	defer principalLimiter.Stop()
 
+	readinessState := &httpapi.ReadinessState{}
 	root := http.NewServeMux()
 	root.Handle("GET /health/live", httpapi.LivenessHandler())
-	root.Handle("GET /health/ready", httpapi.ReadinessHandler(database))
-	root.Handle("/", httpapi.NewProtectedHandlerWithLimiters(repository, verifier, preAuthIPLimiter, principalLimiter))
+	root.Handle("GET /health/ready", httpapi.ReadinessHandlerWithState(database, readinessState))
+	root.Handle("GET /metrics", prom.Registry.Handler())
+	root.Handle("/", httpapi.NewCompleteProtectedHandler(repository, triageRepository, remediationRepository, remediationExecutor, verifier, preAuthIPLimiter, principalLimiter, prom))
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -105,16 +125,30 @@ func run() error {
 	defer stopSignals()
 
 	jobRepository := postgres.NewJobRepository(database)
+	jobRepository.SetMetrics(prom)
+	var processor worker.Processor = worker.NewDefaultIncidentProcessor(jobRepository)
+	if cfg.TriageLLM.APIKey != "" {
+		llmClient, err := llmagent.NewHTTPClient(cfg.TriageLLM.APIKey, cfg.TriageLLM.Endpoint, cfg.TriageLLM.Timeout)
+		if err != nil {
+			return errors.New("could not configure LLM triage client")
+		}
+		processor = triage.NewProcessor(repository, triageRepository, llmClient, triage.ProcessorConfig{
+			Model:       cfg.TriageLLM.Model,
+			PromMetrics: prom,
+		})
+	}
+
 	var workerEngine *worker.Engine
 	if cfg.Worker.Count > 0 {
 		workerEngine = worker.NewEngine(
 			jobRepository,
-			worker.NewDefaultIncidentProcessor(jobRepository),
+			processor,
 			worker.Config{
 				WorkerCount:   cfg.Worker.Count,
 				PollInterval:  cfg.Worker.PollInterval,
 				LeaseDuration: cfg.Worker.LeaseDuration,
 				ShutdownGrace: shutdownTimeout,
+				PromMetrics:   prom,
 			},
 		)
 		workerEngine.Start(signalContext)
@@ -127,6 +161,7 @@ func run() error {
 
 	select {
 	case err := <-serveResult:
+		readinessState.SetDraining(true)
 		if workerEngine != nil {
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), shutdownTimeout)
 			_ = workerEngine.Stop(stopCtx)
@@ -137,6 +172,7 @@ func run() error {
 		}
 		return err
 	case <-signalContext.Done():
+		readinessState.SetDraining(true)
 		shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
 		if err := server.Shutdown(shutdownContext); err != nil {
