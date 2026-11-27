@@ -269,11 +269,7 @@ func TestProviderFailureIsExcludedFromBatchMetrics(t *testing.T) {
 }
 
 func TestHTTPClientUsesInjectedTransportAndDoesNotLeakKey(t *testing.T) {
-	client, err := NewHTTPClient("test-secret", "https://mock.invalid/v1/chat/completions", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	client, err := NewHTTPClientWithTransport("test-secret", "https://mock.invalid/v1/chat/completions", time.Second, DefaultRetryPolicy(), roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-secret" {
 			t.Errorf("unexpected authorization header %q", got)
 		}
@@ -291,7 +287,7 @@ func TestHTTPClientUsesInjectedTransportAndDoesNotLeakKey(t *testing.T) {
 			StatusCode: http.StatusOK, Header: make(http.Header), Request: r,
 			Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Mock endpoint completed."}}]}`)),
 		}, nil
-	})
+	}))
 	agent := newTestAgent(t, client)
 	env := evaluation.NewPaymentEnvironment()
 	tools, _ := env.Reset(context.Background())
@@ -302,14 +298,13 @@ func TestHTTPClientUsesInjectedTransportAndDoesNotLeakKey(t *testing.T) {
 }
 
 func TestHTTPClientClassifiesRateLimitAndHidesBody(t *testing.T) {
-	client, err := NewHTTPClient("never-log-this", "https://mock.invalid/v1/chat/completions", time.Second)
+	client, err := NewHTTPClientWithTransport("never-log-this", "https://mock.invalid/v1/chat/completions", time.Second, DefaultRetryPolicy(), roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Request: r,
+			Body: io.NopCloser(strings.NewReader("sensitive-provider-response"))}, nil
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Request: r,
-			Body: io.NopCloser(strings.NewReader("sensitive-provider-response"))}, nil
-	})
 	_, err = client.Complete(context.Background(), CompletionRequest{Model: "mock"})
 	var providerErr *HTTPError
 	if !errors.As(err, &providerErr) || providerErr.Category != "rate_limit" || strings.Contains(err.Error(), "sensitive-provider-response") {
@@ -318,14 +313,13 @@ func TestHTTPClientClassifiesRateLimitAndHidesBody(t *testing.T) {
 }
 
 func TestHTTPClientTimeout(t *testing.T) {
-	client, err := NewHTTPClient("test-secret", "https://mock.invalid/v1/chat/completions", time.Second)
+	client, err := NewHTTPClientWithTransport("test-secret", "https://mock.invalid/v1/chat/completions", time.Second, DefaultRetryPolicy(), roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		<-r.Context().Done()
-		return nil, r.Context().Err()
-	})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	_, err = client.Complete(ctx, CompletionRequest{Model: "mock"})

@@ -111,14 +111,21 @@ type AgentMetadata struct {
 }
 
 type AgentTraceEntry struct {
-	Event         string `json:"event"`
-	Iteration     int    `json:"iteration,omitempty"`
-	ToolCallID    string `json:"tool_call_id,omitempty"`
-	ToolName      string `json:"tool_name,omitempty"`
-	Arguments     string `json:"arguments,omitempty"`
-	Result        string `json:"result,omitempty"`
-	ErrorCategory string `json:"error_category,omitempty"`
-	Error         string `json:"error,omitempty"`
+	Event            string `json:"event"`
+	Iteration        int    `json:"iteration,omitempty"`
+	ToolCallID       string `json:"tool_call_id,omitempty"`
+	ToolName         string `json:"tool_name,omitempty"`
+	Arguments        string `json:"arguments,omitempty"`
+	Result           string `json:"result,omitempty"`
+	ErrorCategory    string `json:"error_category,omitempty"`
+	Error            string `json:"error,omitempty"`
+	Attempts         int    `json:"attempts,omitempty"`
+	PromptTokens     int    `json:"prompt_tokens,omitempty"`
+	CompletionTokens int    `json:"completion_tokens,omitempty"`
+	TotalTokens      int    `json:"total_tokens,omitempty"`
+	UsageAvailable   *bool  `json:"usage_available,omitempty"`
+	RequestLatencyMs int64  `json:"request_latency_ms,omitempty"`
+	TotalLatencyMs   int64  `json:"total_latency_ms,omitempty"`
 }
 
 type AgentDetails struct {

@@ -64,12 +64,17 @@ func TestRepositoryCreateReplayConflictAndGet(t *testing.T) {
 		t.Fatalf("conflicting payload error = %v, want ErrIdempotencyConflict", err)
 	}
 
-	got, err := repository.Get(ctx, created.ID)
+	got, err := repository.Get(ctx, input.TenantID, created.ID)
 	if err != nil {
 		t.Fatalf("Get incident: %v", err)
 	}
 	if got.ID != created.ID || got.Title != input.Title {
 		t.Fatalf("Get returned %#v; want original incident", got)
+	}
+
+	// Cross-tenant read must return ErrNotFound
+	if _, err := repository.Get(ctx, input.TenantID+"-other", created.ID); err != incident.ErrNotFound {
+		t.Fatalf("cross-tenant Get err = %v, want ErrNotFound", err)
 	}
 
 	var count int

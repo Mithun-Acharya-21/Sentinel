@@ -1,0 +1,94 @@
+name: Sentinel CI
+
+on:
+  push:
+    branches: [main, portfolio-transformation]
+  pull_request:
+    branches: [main, portfolio-transformation]
+
+jobs:
+  unit-and-race:
+    name: Build, Lint, Unit Tests & Race Detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify gofmt formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check git diff whitespace
+        run: git diff --check
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build CLI binaries
+        run: |
+          go build ./cmd/sentinel-api
+          go build ./cmd/sentinel-admin
+          go build ./cmd/sentinel-eval
+          go build ./cmd/sentinel-mock-llm
+
+      - name: Run unit tests
+        run: go test -count=1 ./...
+
+      - name: Run race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...
+
+  postgres-integration:
+    name: PostgreSQL Integration & Race Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel_ci_password
+          POSTGRES_DB: sentinel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sentinel -d sentinel_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply versioned SQL migrations
+        env:
+          PGPASSWORD: sentinel_ci_password
+        run: |
+          for f in migrations/*.up.sql; do
+            echo "Applying $f"
+            psql -h 127.0.0.1 -U sentinel -d sentinel_test -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run PostgreSQL integration tests with race detector
+        env:
+          CGO_ENABLED: "1"
+          SENTINEL_TEST_DATABASE_URL: postgres://sentinel:sentinel_ci_password@127.0.0.1:5432/sentinel_test?sslmode=disable
+        run: go test -v -race -count=1 ./internal/storage/postgres/...

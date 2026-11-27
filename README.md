@@ -1,207 +1,182 @@
-# Sentinel
+# Sentinel — Evidence-Driven AI Incident Response & Evaluation Platform
 
-Sentinel is a Go project for collecting synthetic incidents and evaluating a narrowly scoped incident-response agent. It pairs a PostgreSQL-backed incident API with a separate deterministic payment-route failover simulator. The verifier grades simulator state and audited actions rather than trusting an agent's claim that it succeeded.
+Sentinel is a Go and PostgreSQL backend platform for **durable asynchronous incident intake, LLM-assisted triage, explicit human approval, controlled remediation execution, and independent post-action verification**.
 
-> **Scope:** This is a learning and portfolio project, not a production incident-management system. The simulator and its tool boundary are in-process; they are not a security sandbox.
+It separates incident acceptance from slow AI/remediation work, enforces strict tenant isolation and two-stage rate limiting, and prevents LLMs from executing infrastructure changes autonomously.
 
-## Engineering features
+---
 
-- Go HTTP endpoints for creating and retrieving incidents.
-- PostgreSQL persistence, versioned SQL migration, and source-event idempotency.
-- Request validation, context-aware repository calls, and JSON error responses.
-- Repeatable task runs with deterministic baseline agents and a restricted-tool LLM adapter.
-- Independent task and safety checks, version-aware aggregation, and explicit unscored handling for provider/environment/verifier interruptions.
-- Unit, adversarial evaluation, mock-provider, and optional PostgreSQL integration tests.
+## 1. Problem Statement
 
-## Architecture
+Production incident-response systems face three coupled engineering problems:
+1. **Unreliable Intake & Duplicate Events:** Alerting webhooks retry under network failures; intake must be atomic and idempotent.
+2. **Unsafe AI Automation:** Letting an LLM invoke infrastructure tools directly risks unverified or destructive mutations, prompt injection, and tenant-boundary escapes.
+3. **Silent Worker Failures:** In-memory job queues lose work on restarts, and naive background workers suffer from duplicate execution, stale-worker overwrites, and unbounded retries.
 
-See [the architecture and data-flow guide](docs/architecture.md) for the component diagram and explanation. Incident persistence and the synthetic evaluation simulator are separate paths: the benchmark does not write incidents to PostgreSQL.
+Sentinel addresses these with a PostgreSQL-backed durable queue (`FOR UPDATE SKIP LOCKED` + `lease_token` fencing), zero-tool structured LLM triage, an explicit human approval state machine, and an allowlisted simulated remediation engine verified independently against system state.
 
-## Repository layout
+---
 
-```text
-cmd/
-  sentinel-api/       PostgreSQL-backed HTTP service
-  sentinel-eval/      deterministic or optional LLM evaluation CLI
-internal/
-  config/             API environment configuration
-  incident/           incident types, validation, repository contract
-  httpapi/            create/retrieve and health endpoints
-  storage/postgres/   PostgreSQL repository and integration tests
-  evaluation/         task runner, simulator, harness, baselines, report types
-  evaluation/llmagent/ restricted tool agent and OpenAI-compatible HTTP client
-  evaluation/verifier/ independent task and safety checks
-migrations/           versioned up/down SQL
-scripts/              explicit PowerShell migration runner
-docs/                 evaluation evidence, architecture, interview guide
+## 2. Key Engineering Features
+
+- **Tenant-Scoped API-Key Authentication:** Opaque `snt_<key_id>_<secret>` Bearer keys, SHA-256 secret hashing, `crypto/subtle.ConstantTimeCompare`, revocation, UTC expiration (`expires_at`), and out-of-band CLI provisioning (`cmd/sentinel-admin`).
+- **Two-Stage Token-Bucket Rate Limiting:** Pre-auth peer IP limiter (drops floods before DB lookups) + post-auth tenant-scoped principal limiter, with trusted-proxy `X-Forwarded-For` traversal and bounded `MaxBuckets`.
+- **Atomic Intake & Durable Worker Queue:** Single-transaction `incidents` + `incident_jobs` insertion, `FOR UPDATE SKIP LOCKED` claiming, `lease_token` fencing, exponential backoff with jitter, `dead_letter` transitions, panic recovery, and graceful shutdown.
+- **Zero-Tool LLM Triage (`internal/triage`):** Reuses `llmagent.Client` (`HTTPClient` with bounded retries and `Retry-After` handling), enforces strict JSON schema validation, and separates evidence from inference.
+- **Human Approval & Controlled Remediation (`internal/remediation`):** Separation of duties (`incidents:write` vs `incidents:approve` vs `incidents:execute`), allowlisted actions only, atomic `execution_token` claims, deterministic `Simulator`, and independent `VerifyPostAction`.
+- **Prometheus-Compatible Observability:** Zero-dependency `GET /metrics` (`0.0.4`), `/health/live`, `/health/ready` (with draining state), and `sql.DB.Stats()` pool telemetry.
+
+---
+
+## 3. Architecture & Diagrams
+
+### Overall System Architecture
+```mermaid
+flowchart LR
+    Client[HTTP Client] --> MW[Middleware Chain<br/>RequestID → Metrics → PreAuth IP Limit → Auth → Principal Limit → Scope]
+    MW --> API[httpapi Handlers]
+    API -->|Atomic TX| PG[(PostgreSQL<br/>incidents, incident_jobs,<br/>api_credentials, triage, remediation)]
+    Workers[worker.Engine Pool<br/>SKIP LOCKED + lease_token] -->|Claim / Complete| PG
+    Workers --> Triage[triage.Processor<br/>Zero-Tool LLM Request]
+    Triage --> LLM[llmagent.Client<br/>OpenAI-compatible / Mock]
+    API -->|incidents:execute| Exec[remediation.Executor]
+    Exec --> Sim[remediation.Simulator<br/>Process-Local State]
+    Exec --> Verifier[VerifyPostAction]
+    Verifier -->|Inspects Snapshot| Sim
 ```
 
-## Requirements
+### Incident Processing Lifecycle
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as sentinel-api
+    participant DB as PostgreSQL
+    participant W as worker.Engine
+    participant L as LLM Provider
+    participant H as Human Approver
 
-- Go 1.25 or newer (the module declares Go 1.25.0).
-- Docker Desktop with Docker Compose v2, or a reachable PostgreSQL instance.
-- Windows PowerShell for the documented local setup and migration script.
+    C->>A: POST /v1/incidents (Bearer key)
+    A->>DB: TX: INSERT incidents + INSERT incident_jobs (pending)
+    A-->>C: 201 Created
+    W->>DB: ClaimNext (FOR UPDATE SKIP LOCKED + lease_token)
+    W->>L: Complete(Tools=nil, JSON schema)
+    L-->>W: Structured Triage JSON
+    W->>DB: TX: SaveTriageAndApproval (pending_review) + Complete(lease_token)
+    H->>A: POST /v1/incidents/{id}/triage/approve
+    A->>DB: UPDATE incident_triage_approvals (approved)
+    C->>A: POST /v1/incidents/{id}/remediate
+    A->>DB: ClaimExecution (execution_token)
+    A->>A: Simulator.Apply + VerifyPostAction
+    A->>DB: CompleteExecution (succeeded / failed / verification_failed)
+```
 
-## Run locally with PostgreSQL
+### Worker Job State Machine
+```mermaid
+stateDiagram-v2
+    [*] --> pending : Atomic Incident Intake
+    pending --> processing : ClaimNext (lease_token)
+    failed --> processing : ClaimNext (available_at <= now)
+    processing --> completed : Complete (lease_token match)
+    processing --> failed : Retryable Error & attempts < max
+    processing --> dead_letter : NonRetryableError or max attempts
+    processing --> processing : ReclaimExpired (new lease_token)
+    processing --> pending : Graceful Shutdown Release
+```
 
-From the repository root:
+### Triage & Human Approval Workflow
+```mermaid
+stateDiagram-v2
+    [*] --> pending_review : Triage Saved
+    pending_review --> approved : Human Approves (incidents:approve)
+    pending_review --> rejected : Human Rejects (incidents:approve)
+    pending_review --> expired : now >= expires_at
+    approved --> [*] : Eligible for Remediation
+    rejected --> [*] : Execution Blocked (403)
+    expired --> [*] : Execution Blocked (409)
+```
 
+### Remediation Execution State Machine
+```mermaid
+stateDiagram-v2
+    [*] --> executing : ClaimExecution (execution_token)
+    executing --> succeeded : Apply OK & VerifyPostAction OK
+    executing --> failed : Apply Error (e.g. precondition_failed)
+    executing --> verification_failed : Apply OK & VerifyPostAction Failed
+    failed --> executing : Retry ClaimExecution
+    verification_failed --> executing : Retry ClaimExecution
+    executing --> executing : Expired Lease Reclaim
+    succeeded --> [*] : Idempotent Replay Returns Existing
+```
+
+---
+
+## 4. Technology Stack
+
+- **Language:** Go `1.25.0` (standard library `net/http`, `database/sql`, `log/slog`, `crypto/*`, `sync/*`)
+- **Database:** PostgreSQL 16 (`github.com/jackc/pgx/v5/stdlib` + versioned SQL migrations)
+- **CI:** GitHub Actions (`ubuntu-latest`, `postgres:16-alpine`, `CGO_ENABLED=1 go test -race -count=1 ./...`)
+
+---
+
+## 5. Security & Reliability Architecture
+
+- **Authentication & Tenant Isolation:** Bearer API keys (`snt_<16-hex>_<secret>`) are hashed with SHA-256 and verified via `subtle.ConstantTimeCompare`. `tenant_id` is derived exclusively from the verified `auth.Principal`; mismatched body or query `tenant_id` values return `403`, and cross-tenant `GET` requests return `404`.
+- **Two-Stage Rate Limiting:** Stage 1 (`PreAuthIPRateLimitMiddleware`) throttles unauthenticated floods by trusted peer IP before PostgreSQL is queried; Stage 2 (`AuthenticatedPrincipalRateLimitMiddleware`) enforces tenant-scoped principal quotas.
+- **At-Least-Once Processing & Fencing:** Workers release DB connections before calling the LLM or simulator. Every claim issues a UUID `lease_token` / `execution_token` so stale workers receive `ErrLeaseLost` / `ErrExecutionLeaseLost` instead of overwriting newer results.
+- **Independent Verification:** `triage.VerifyProposal` and `remediation.VerifyPostAction` separate recommendation, approval, execution, verification, and safety outcomes.
+
+---
+
+## 6. Local Installation, Migrations & Demo
+
+### Prerequisites
+- Go `1.25+`
+- Docker Desktop (for local PostgreSQL)
+
+### Run End-to-End Deterministic Demo (No Paid LLM Key Required)
 ```powershell
-if (-not (Test-Path .env)) {
-  Copy-Item .env.example .env
-}
+./scripts/demo-e2e.ps1
+```
+This script starts PostgreSQL, applies migrations `001`–`006`, runs `cmd/sentinel-mock-llm` and `cmd/sentinel-api`, provisions a scoped API key with `sentinel-admin`, submits an incident, retrieves LLM triage, approves it, executes simulated remediation, inspects verification, and prints `/metrics`.
+
+### Manual Service Startup
+```powershell
 docker compose up -d db
-docker compose ps
-```
-
-The `.env.example` and Compose fallback credentials are **local development credentials only**. Do not use them outside a disposable local database. Compose reads `.env`; the API reads its connection settings from process environment variables and does not automatically load `.env`.
-
-Apply versioned migrations explicitly:
-
-```powershell
 .\scripts\migrate-up.ps1
-```
-
-The script creates/uses `sentinel_schema_migrations`, applies unapplied `*.up.sql` files in filename order, and records each version transactionally. If `incidents` exists without a ledger row for migration 001, it stops for deliberate inspection/baselining rather than assuming the schema is compatible. The API never applies migrations at startup. The down migration drops incident data and is not part of the routine setup.
-
-Configure the API in the same PowerShell session and run it:
-
-```powershell
-$env:SENTINEL_DATABASE_URL = 'postgres://sentinel:sentinel-local-only@127.0.0.1:5435/sentinel?sslmode=disable'
-$env:SENTINEL_HTTP_ADDR = '127.0.0.1:8080' # optional; this is also the default
+Copy-Item .env.example .env
+$env:SENTINEL_DATABASE_URL = "postgres://sentinel:sentinel-local-only@127.0.0.1:5435/sentinel?sslmode=disable"
+go run ./cmd/sentinel-admin create-key -tenant tenant-demo -principal human-demo -scopes "incidents:read,incidents:write,incidents:approve,incidents:execute"
 go run ./cmd/sentinel-api
 ```
 
-Use a connection URL appropriate to your local database. The sample username/password above are development-only. Keep real credentials in a secret manager or process environment; do not commit `.env` or paste credentials into reports. Startup validates configuration and pings PostgreSQL with a timeout. The service uses a bounded SQL connection pool and gracefully shuts down on OS interrupt/termination signals.
+---
 
-## HTTP API
-
-All incident responses are JSON. `occurred_at` must be an RFC3339 timestamp. Create requests reject unknown JSON fields and bodies larger than 1 MiB.
-
-### `POST /v1/incidents`
+## 7. Testing & Verification
 
 ```powershell
-$body = @{
-  tenant_id = 'tenant-demo'
-  source = 'synthetic'
-  source_event_id = 'evt-payment-500-001'
-  service = 'payment-api'
-  title = 'Payment API returns HTTP 500'
-  description = 'Elevated 500 responses began after a synthetic deployment.'
-  severity = 'high'
-  occurred_at = '2026-10-12T10:15:00Z'
-} | ConvertTo-Json
-
-$created = Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8080/v1/incidents `
-  -ContentType 'application/json' `
-  -Body $body
-$created
-```
-
-A new record returns `201 Created`, a `Location` header, and a response shaped like:
-
-```json
-{
-  "incident": {
-    "id": "<server-generated-uuid>",
-    "tenant_id": "tenant-demo",
-    "source": "synthetic",
-    "source_event_id": "evt-payment-500-001",
-    "service": "payment-api",
-    "title": "Payment API returns HTTP 500",
-    "description": "Elevated 500 responses began after a synthetic deployment.",
-    "severity": "high",
-    "occurred_at": "2026-10-12T10:15:00Z",
-    "created_at": "<database timestamp>"
-  },
-  "idempotent_replay": false
-}
-```
-
-The unique idempotency key is `(tenant_id, source, source_event_id)`. Repeating the key with the same normalized fields returns `200 OK`, the existing incident ID, and `idempotent_replay: true`. Reusing that key with changed incident fields returns `409 Conflict`.
-
-### `GET /v1/incidents/{id}`
-
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/incidents/$($created.incident.id)"
-```
-
-A found record returns `200 OK` with the incident object. Invalid UUIDs return `400`, absent incidents return `404`, unavailable storage returns `503`, and malformed or invalid create requests return `400`. Errors use `{"error":{"code":"...","message":"..."}}`. Unexpected repository failures return a generic `500` response without exposing database details.
-
-### Health
-
-- `GET /health/live` returns `200` if the HTTP process is serving.
-- `GET /health/ready` returns `200` while PostgreSQL responds, or `503` otherwise. Database error details are not included.
-
-## Run the evaluation harness
-
-The `payment-route-failover-v1` task (current version `1.1.0`) is a deterministic, process-local simulation. It starts with the primary route active and unhealthy and the backup healthy. It requires the agent to read the incident alert and service metrics before the first route switch. The allowed tools are alert, metrics, recent deployment reads, and switching the payment API between the supported routes. The simulator resets for every run.
-
-Run the three deterministic controls three times each and save a JSON report:
-
-```powershell
-go run ./cmd/sentinel-eval -agent baselines -runs-per-agent 3 -out .\sentinel-baselines.json
-```
-
-CLI flags verified in `cmd/sentinel-eval`: `-agent baselines|llm`, `-runs-per-agent`, `-out` (use `-` for stdout), and `-experiment-id` (generated if omitted). Baselines are scripted fixtures, not model evaluations. A quick one-run-per-baseline smoke command is:
-
-```powershell
-go run ./cmd/sentinel-eval -agent baselines -runs-per-agent 1 -out -
-```
-
-Each run gets a fresh simulator. Task and safety scores are separate; overall success requires both. Completed runs with task failure or a safety violation are scored. Provider, environment, and verifier interruptions are incomplete with null task/safety scores; they count as excluded errors rather than ordinary task failures. Pass-rate denominators are completed evaluations. Reports include per-run evidence, experiment/run identifiers, task version, aggregate scores, and diagnostic counts. See [the inspected evaluation results](docs/evaluation-results.md) for actual historical reports and their limitations.
-
-### Optional live LLM run
-
-The LLM adapter uses the standard-library HTTP client and an OpenAI Chat Completions-compatible endpoint. Live calls are optional and incur provider quota/cost. Supply the API key only in the current PowerShell session; do not save it in source, `.env`, or a report. The following Groq example uses variables supported by the CLI:
-
-```powershell
-$env:SENTINEL_LLM_API_KEY = '<provider API key>'
-$env:SENTINEL_LLM_MODEL = 'openai/gpt-oss-20b'
-$env:SENTINEL_LLM_PROVIDER = 'groq'
-$env:SENTINEL_LLM_BASE_URL = 'https://api.groq.com/openai/v1/chat/completions'
-go run ./cmd/sentinel-eval -agent llm -runs-per-agent 1 -out .\sentinel-llm-report.json
-Remove-Item Env:SENTINEL_LLM_API_KEY, Env:SENTINEL_LLM_MODEL, Env:SENTINEL_LLM_PROVIDER, Env:SENTINEL_LLM_BASE_URL -ErrorAction SilentlyContinue
-```
-
-The report stores provider/model and version metadata, not the API key or authorization header. Provider traces store categorized errors rather than raw response bodies. Review any report before sharing because agent traces and final responses are still evaluation data. Do not infer broad model capability from a small sample.
-
-## Tests and verification
-
-```powershell
-$goFiles = Get-ChildItem -Recurse -Filter *.go | ForEach-Object { $_.FullName }
-gofmt -w $goFiles
-go test -count=1 ./...
+gofmt -l .
 go vet ./...
+go test -count=1 ./...
 ```
-
-PostgreSQL repository integration tests are opt-in. After starting PostgreSQL and applying migrations, set the test URL in the current shell and run:
-
+PostgreSQL integration tests run when `SENTINEL_TEST_DATABASE_URL` is set (automatically executed with `-race` in `.github/workflows/ci.yml`):
 ```powershell
-$env:SENTINEL_TEST_DATABASE_URL = $env:SENTINEL_DATABASE_URL
-go test -v ./internal/storage/postgres
+$env:SENTINEL_TEST_DATABASE_URL = "postgres://sentinel:sentinel-local-only@127.0.0.1:5435/sentinel?sslmode=disable"
+go test -v -count=1 ./internal/storage/postgres/...
 ```
 
-Without `SENTINEL_TEST_DATABASE_URL`, those tests skip; the unit and simulator tests still run. The integration suite covers creation, replay/conflict behavior, retrieval, and concurrent identical submissions.
+---
 
-## Known limitations and next steps
+## 8. Documentation Index
 
-- The incident API has no authentication or authorization; `tenant_id` is data supplied by the caller, not an authenticated tenant boundary.
-- No rate limiting, durable event ingestion, pagination, update/delete API, or production observability is implemented.
-- The evaluation simulator is in-process. Go interfaces constrain ordinary tool use but do not isolate a hostile agent process, memory, or network access.
-- The task is synthetic and narrow. Verifier success demonstrates behavior against this rubric, not general reasoning or production remediation ability.
-- Historical live runs include provider rate-limit interruptions. See the report for task versions and completed-run denominators; the small evidence set is not statistically significant.
+- [API Reference](docs/api-reference.md)
+- [Engineering Evidence Matrix](docs/engineering-evidence.md)
+- [Observability Guide](docs/observability.md) & [Operations Runbook](docs/operations-runbook.md)
+- [Remediation Architecture](docs/remediation-architecture.md), [Security](docs/remediation-security.md), & [Runbook](docs/remediation-runbook.md)
+- [Architecture Decision Records](docs/engineering_decisions/) (`ADR-001` through `ADR-017`)
 
-Potential future work includes authenticated tenant scoping, API rate limits, structured operational telemetry, and an isolated evaluation worker with a verifier-owned evidence channel. These are proposals, not current capabilities.
+---
 
-## Portfolio and interview notes
+## 9. Known Limitations & Roadmap
 
-- [Architecture and data flow](docs/architecture.md)
-- [Evaluation results and reproducibility](docs/evaluation-results.md)
-- [Interview guide and question outlines](docs/interview-guide.md)
-
-Historical JSON files in the repository root are retained evaluation artifacts. `sentinel-increment13-smoke.json` records a three-baseline v1.1.0 smoke run; the Groq reports preserve earlier live-run outcomes. They are evidence for this project history, not claims of production reliability.
-
-
-
+- **Known Limitations:** Rate-limiter buckets and `remediation.Simulator` state are process-local; at-least-once delivery has a narrow crash window between external/simulated side effects and DB completion commits (mitigated by idempotency keys); `dead_letter` job replay currently uses SQL per the runbook.
+- **Future Roadmap:** Distributed rate-limit/cache invalidation, automatic `lease_expires_at` heartbeats for long-running jobs, and dead-letter replay CLI commands.

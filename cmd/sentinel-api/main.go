@@ -11,9 +11,15 @@ import (
 	"syscall"
 	"time"
 
+	"sentinel/internal/auth"
 	"sentinel/internal/config"
+	"sentinel/internal/evaluation/llmagent"
 	"sentinel/internal/httpapi"
+	"sentinel/internal/metrics"
+	"sentinel/internal/remediation"
 	"sentinel/internal/storage/postgres"
+	"sentinel/internal/triage"
+	"sentinel/internal/worker"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -53,11 +59,58 @@ func run() error {
 		return errors.New("PostgreSQL startup check failed; verify SENTINEL_DATABASE_URL and database availability")
 	}
 
+	prom := metrics.NewSentinelMetrics()
+	prom.RegisterDBPool(database)
+
 	repository := postgres.NewRepository(database)
+	repository.SetMetrics(prom)
+	triageRepository := postgres.NewTriageRepository(database)
+	triageRepository.SetMetrics(prom)
+	remediationRepository := postgres.NewRemediationRepository(database)
+	remediationRepository.SetMetrics(prom)
+	simEnv := remediation.NewSimulator(nil)
+	remediationExecutor := remediation.NewExecutor(triageRepository, remediationRepository, simEnv, remediation.ExecutorConfig{
+		PromMetrics: prom,
+	})
+	credRepository := postgres.NewCredentialRepository(database)
+	verifier := auth.NewStoreVerifier(credRepository)
+
+	preAuthIPLimiter, err := httpapi.NewLimiter(httpapi.RateLimitConfig{
+		Enabled:         cfg.PreAuthRateLimit.Enabled,
+		RequestsPerSec:  cfg.PreAuthRateLimit.RequestsPerSec,
+		BurstCapacity:   cfg.PreAuthRateLimit.BurstCapacity,
+		BucketTTL:       httpapi.DefaultBucketTTL,
+		CleanupInterval: httpapi.DefaultCleanupInterval,
+		MaxBuckets:      httpapi.DefaultMaxBuckets,
+		TrustedProxies:  cfg.PreAuthRateLimit.TrustedProxies,
+		PromMetrics:     prom,
+	})
+	if err != nil {
+		return errors.New("could not configure pre-auth IP rate limiter")
+	}
+	defer preAuthIPLimiter.Stop()
+
+	principalLimiter, err := httpapi.NewLimiter(httpapi.RateLimitConfig{
+		Enabled:         cfg.RateLimit.Enabled,
+		RequestsPerSec:  cfg.RateLimit.RequestsPerSec,
+		BurstCapacity:   cfg.RateLimit.BurstCapacity,
+		BucketTTL:       httpapi.DefaultBucketTTL,
+		CleanupInterval: httpapi.DefaultCleanupInterval,
+		MaxBuckets:      httpapi.DefaultMaxBuckets,
+		TrustedProxies:  cfg.RateLimit.TrustedProxies,
+		PromMetrics:     prom,
+	})
+	if err != nil {
+		return errors.New("could not configure principal rate limiter")
+	}
+	defer principalLimiter.Stop()
+
+	readinessState := &httpapi.ReadinessState{}
 	root := http.NewServeMux()
 	root.Handle("GET /health/live", httpapi.LivenessHandler())
-	root.Handle("GET /health/ready", httpapi.ReadinessHandler(database))
-	root.Handle("/", httpapi.New(repository))
+	root.Handle("GET /health/ready", httpapi.ReadinessHandlerWithState(database, readinessState))
+	root.Handle("GET /metrics", prom.Registry.Handler())
+	root.Handle("/", httpapi.NewCompleteProtectedHandler(repository, triageRepository, remediationRepository, remediationExecutor, verifier, preAuthIPLimiter, principalLimiter, prom))
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -71,6 +124,36 @@ func run() error {
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	jobRepository := postgres.NewJobRepository(database)
+	jobRepository.SetMetrics(prom)
+	var processor worker.Processor = worker.NewDefaultIncidentProcessor(jobRepository)
+	if cfg.TriageLLM.APIKey != "" {
+		llmClient, err := llmagent.NewHTTPClient(cfg.TriageLLM.APIKey, cfg.TriageLLM.Endpoint, cfg.TriageLLM.Timeout)
+		if err != nil {
+			return errors.New("could not configure LLM triage client")
+		}
+		processor = triage.NewProcessor(repository, triageRepository, llmClient, triage.ProcessorConfig{
+			Model:       cfg.TriageLLM.Model,
+			PromMetrics: prom,
+		})
+	}
+
+	var workerEngine *worker.Engine
+	if cfg.Worker.Count > 0 {
+		workerEngine = worker.NewEngine(
+			jobRepository,
+			processor,
+			worker.Config{
+				WorkerCount:   cfg.Worker.Count,
+				PollInterval:  cfg.Worker.PollInterval,
+				LeaseDuration: cfg.Worker.LeaseDuration,
+				ShutdownGrace: shutdownTimeout,
+				PromMetrics:   prom,
+			},
+		)
+		workerEngine.Start(signalContext)
+	}
+
 	serveResult := make(chan error, 1)
 	go func() {
 		serveResult <- server.ListenAndServe()
@@ -78,18 +161,33 @@ func run() error {
 
 	select {
 	case err := <-serveResult:
+		readinessState.SetDraining(true)
+		if workerEngine != nil {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), shutdownTimeout)
+			_ = workerEngine.Stop(stopCtx)
+			cancelStop()
+		}
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	case <-signalContext.Done():
+		readinessState.SetDraining(true)
 		shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
 		if err := server.Shutdown(shutdownContext); err != nil {
 			_ = server.Close()
+			if workerEngine != nil {
+				_ = workerEngine.Stop(shutdownContext)
+			}
 			return errors.New("HTTP server did not shut down cleanly before the deadline")
 		}
 		<-serveResult
+		if workerEngine != nil {
+			if err := workerEngine.Stop(shutdownContext); err != nil {
+				return errors.New("background workers did not stop cleanly before the deadline")
+			}
+		}
 		return nil
 	}
 }
