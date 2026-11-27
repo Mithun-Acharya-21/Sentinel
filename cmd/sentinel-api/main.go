@@ -11,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"sentinel/internal/auth"
 	"sentinel/internal/config"
 	"sentinel/internal/httpapi"
 	"sentinel/internal/storage/postgres"
+	"sentinel/internal/worker"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -54,10 +56,41 @@ func run() error {
 	}
 
 	repository := postgres.NewRepository(database)
+	credRepository := postgres.NewCredentialRepository(database)
+	verifier := auth.NewStoreVerifier(credRepository)
+
+	preAuthIPLimiter, err := httpapi.NewLimiter(httpapi.RateLimitConfig{
+		Enabled:         cfg.PreAuthRateLimit.Enabled,
+		RequestsPerSec:  cfg.PreAuthRateLimit.RequestsPerSec,
+		BurstCapacity:   cfg.PreAuthRateLimit.BurstCapacity,
+		BucketTTL:       httpapi.DefaultBucketTTL,
+		CleanupInterval: httpapi.DefaultCleanupInterval,
+		MaxBuckets:      httpapi.DefaultMaxBuckets,
+		TrustedProxies:  cfg.PreAuthRateLimit.TrustedProxies,
+	})
+	if err != nil {
+		return errors.New("could not configure pre-auth IP rate limiter")
+	}
+	defer preAuthIPLimiter.Stop()
+
+	principalLimiter, err := httpapi.NewLimiter(httpapi.RateLimitConfig{
+		Enabled:         cfg.RateLimit.Enabled,
+		RequestsPerSec:  cfg.RateLimit.RequestsPerSec,
+		BurstCapacity:   cfg.RateLimit.BurstCapacity,
+		BucketTTL:       httpapi.DefaultBucketTTL,
+		CleanupInterval: httpapi.DefaultCleanupInterval,
+		MaxBuckets:      httpapi.DefaultMaxBuckets,
+		TrustedProxies:  cfg.RateLimit.TrustedProxies,
+	})
+	if err != nil {
+		return errors.New("could not configure principal rate limiter")
+	}
+	defer principalLimiter.Stop()
+
 	root := http.NewServeMux()
 	root.Handle("GET /health/live", httpapi.LivenessHandler())
 	root.Handle("GET /health/ready", httpapi.ReadinessHandler(database))
-	root.Handle("/", httpapi.New(repository))
+	root.Handle("/", httpapi.NewProtectedHandlerWithLimiters(repository, verifier, preAuthIPLimiter, principalLimiter))
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -71,6 +104,22 @@ func run() error {
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	jobRepository := postgres.NewJobRepository(database)
+	var workerEngine *worker.Engine
+	if cfg.Worker.Count > 0 {
+		workerEngine = worker.NewEngine(
+			jobRepository,
+			worker.NewDefaultIncidentProcessor(jobRepository),
+			worker.Config{
+				WorkerCount:   cfg.Worker.Count,
+				PollInterval:  cfg.Worker.PollInterval,
+				LeaseDuration: cfg.Worker.LeaseDuration,
+				ShutdownGrace: shutdownTimeout,
+			},
+		)
+		workerEngine.Start(signalContext)
+	}
+
 	serveResult := make(chan error, 1)
 	go func() {
 		serveResult <- server.ListenAndServe()
@@ -78,6 +127,11 @@ func run() error {
 
 	select {
 	case err := <-serveResult:
+		if workerEngine != nil {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), shutdownTimeout)
+			_ = workerEngine.Stop(stopCtx)
+			cancelStop()
+		}
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -87,9 +141,17 @@ func run() error {
 		defer cancelShutdown()
 		if err := server.Shutdown(shutdownContext); err != nil {
 			_ = server.Close()
+			if workerEngine != nil {
+				_ = workerEngine.Stop(shutdownContext)
+			}
 			return errors.New("HTTP server did not shut down cleanly before the deadline")
 		}
 		<-serveResult
+		if workerEngine != nil {
+			if err := workerEngine.Stop(shutdownContext); err != nil {
+				return errors.New("background workers did not stop cleanly before the deadline")
+			}
+		}
 		return nil
 	}
 }

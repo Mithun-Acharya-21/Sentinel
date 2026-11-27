@@ -5,14 +5,20 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"sentinel/internal/incident"
 )
 
-// Repository stores incidents in PostgreSQL. The caller owns the database pool lifecycle.
+const defaultMaxJobAttempts = 5
+
+// Repository stores incidents and their durable processing jobs in PostgreSQL.
+// The caller owns the database pool lifecycle.
 type Repository struct {
-	db *sql.DB
+	db          *sql.DB
+	jobsCreated atomic.Uint64
 }
 
 // NewRepository creates an incident repository over an already configured database pool.
@@ -20,16 +26,28 @@ func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// JobsCreated returns the number of durable processing jobs created by this repository instance.
+func (r *Repository) JobsCreated() uint64 {
+	return r.jobsCreated.Load()
+}
+
 var _ incident.Repository = (*Repository)(nil)
 
 const incidentColumns = `id::text, tenant_id, source, source_event_id, service, title, description, severity, occurred_at, created_at`
 
-// Create inserts a new incident or identifies a duplicate source event.
+// Create atomically inserts a new incident and its pending durable processing job,
+// or identifies a duplicate source event without creating duplicate jobs.
 // replay is true only when the existing row has the same payload.
 func (r *Repository) Create(ctx context.Context, input incident.CreateInput) (incident.Incident, bool, error) {
 	// PostgreSQL timestamps store microseconds. Normalize before writing and comparing
 	// so retries with higher-precision RFC3339 timestamps remain idempotent.
 	input.OccurredAt = input.OccurredAt.UTC().Truncate(time.Microsecond)
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return incident.Incident{}, false, storageError("begin incident transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 
 	query := `
 INSERT INTO incidents (
@@ -38,7 +56,7 @@ INSERT INTO incidents (
 ON CONFLICT (tenant_id, source, source_event_id) DO NOTHING
 RETURNING ` + incidentColumns
 
-	created, err := scanIncident(r.db.QueryRowContext(ctx, query,
+	created, err := scanIncident(tx.QueryRowContext(ctx, query,
 		input.TenantID,
 		input.Source,
 		input.SourceEventID,
@@ -49,6 +67,16 @@ RETURNING ` + incidentColumns
 		input.OccurredAt,
 	))
 	if err == nil {
+		const jobQuery = `
+INSERT INTO incident_jobs (tenant_id, incident_id, status, max_attempts)
+VALUES ($1, $2::uuid, 'pending', $3)`
+		if _, jobErr := tx.ExecContext(ctx, jobQuery, created.TenantID, created.ID, defaultMaxJobAttempts); jobErr != nil {
+			return incident.Incident{}, false, storageError("create incident job", jobErr)
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return incident.Incident{}, false, storageError("commit incident and job", commitErr)
+		}
+		r.jobsCreated.Add(1)
 		return created, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -57,20 +85,26 @@ RETURNING ` + incidentColumns
 
 	// ON CONFLICT waits for an in-flight insert on this unique key. This SELECT is a
 	// new statement under READ COMMITTED, so it sees the row that won the conflict.
-	existing, err := r.findByEventKey(ctx, input.TenantID, input.Source, input.SourceEventID)
+	existing, err := findByEventKeyTx(ctx, tx, input.TenantID, input.Source, input.SourceEventID)
 	if err != nil {
 		return incident.Incident{}, false, err
 	}
 	if !samePayload(existing, input) {
 		return incident.Incident{}, false, incident.ErrIdempotencyConflict
 	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		return incident.Incident{}, false, storageError("commit idempotent replay", commitErr)
+	}
 	return existing, true, nil
 }
 
-// Get retrieves an incident by its UUID string.
-func (r *Repository) Get(ctx context.Context, id string) (incident.Incident, error) {
-	query := `SELECT ` + incidentColumns + ` FROM incidents WHERE id = $1::uuid`
-	got, err := scanIncident(r.db.QueryRowContext(ctx, query, id))
+// Get retrieves an incident by its UUID string, strictly scoped to tenantID.
+func (r *Repository) Get(ctx context.Context, tenantID, id string) (incident.Incident, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return incident.Incident{}, incident.ErrNotFound
+	}
+	query := `SELECT ` + incidentColumns + ` FROM incidents WHERE id = $1::uuid AND tenant_id = $2`
+	got, err := scanIncident(r.db.QueryRowContext(ctx, query, id, tenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return incident.Incident{}, incident.ErrNotFound
 	}
@@ -80,11 +114,11 @@ func (r *Repository) Get(ctx context.Context, id string) (incident.Incident, err
 	return got, nil
 }
 
-func (r *Repository) findByEventKey(ctx context.Context, tenantID, source, sourceEventID string) (incident.Incident, error) {
+func findByEventKeyTx(ctx context.Context, tx *sql.Tx, tenantID, source, sourceEventID string) (incident.Incident, error) {
 	query := `SELECT ` + incidentColumns + `
 FROM incidents
 WHERE tenant_id = $1 AND source = $2 AND source_event_id = $3`
-	got, err := scanIncident(r.db.QueryRowContext(ctx, query, tenantID, source, sourceEventID))
+	got, err := scanIncident(tx.QueryRowContext(ctx, query, tenantID, source, sourceEventID))
 	if err != nil {
 		return incident.Incident{}, storageError("find incident by source event", err)
 	}

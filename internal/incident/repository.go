@@ -13,7 +13,8 @@ var (
 
 // Repository is the persistence boundary used by the HTTP API.
 // Create reports replay=true when an identical source event already exists.
+// Get is strictly tenant-scoped.
 type Repository interface {
 	Create(ctx context.Context, input CreateInput) (created Incident, replay bool, err error)
-	Get(ctx context.Context, id string) (Incident, error)
+	Get(ctx context.Context, tenantID, id string) (Incident, error)
 }

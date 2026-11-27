@@ -23,6 +23,7 @@ const (
 type HTTPError struct {
 	Category   string
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string { return e.SafeMessage() }
@@ -46,13 +47,37 @@ func (e *HTTPError) SafeMessage() string {
 	}
 }
 
+type RoundTripper interface {
+	RoundTrip(*http.Request) (*http.Response, error)
+}
+
 type HTTPClient struct {
-	endpoint string
-	apiKey   string
-	client   *http.Client
+	endpoint  string
+	apiKey    string
+	transport http.RoundTripper
+	timeout   time.Duration
+	retry     RetryPolicy
+}
+
+// Client returns an *http.Client configured with the HTTPClient's transport and timeout.
+// This preserves backward compatibility for existing tests that inspect or inject Transport.
+func (c *HTTPClient) Client() *http.Client {
+	return &http.Client{
+		Timeout:       c.timeout,
+		Transport:     c.transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func NewHTTPClient(apiKey, endpoint string, timeout time.Duration) (*HTTPClient, error) {
+	return NewHTTPClientWithRetry(apiKey, endpoint, timeout, DefaultRetryPolicy())
+}
+
+func NewHTTPClientWithRetry(apiKey, endpoint string, timeout time.Duration, retry RetryPolicy) (*HTTPClient, error) {
+	return NewHTTPClientWithTransport(apiKey, endpoint, timeout, retry, nil)
+}
+
+func NewHTTPClientWithTransport(apiKey, endpoint string, timeout time.Duration, retry RetryPolicy, transport http.RoundTripper) (*HTTPClient, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, errors.New("model API key is required")
 	}
@@ -72,13 +97,97 @@ func NewHTTPClient(apiKey, endpoint string, timeout time.Duration) (*HTTPClient,
 	if timeout < time.Second || timeout > 2*time.Minute {
 		return nil, errors.New("provider timeout must be between 1 second and 2 minutes")
 	}
-	return &HTTPClient{endpoint: endpoint, apiKey: apiKey, client: &http.Client{
-		Timeout:       timeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}}, nil
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return &HTTPClient{
+		endpoint:  endpoint,
+		apiKey:    apiKey,
+		transport: transport,
+		timeout:   timeout,
+		retry:     retry,
+	}, nil
 }
 
 func (c *HTTPClient) Complete(ctx context.Context, input CompletionRequest) (CompletionResponse, error) {
+	maxAttempts := c.retry.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	startTotal := time.Now()
+	var diagnostics []AttemptDiagnostic
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return CompletionResponse{
+				Attempts:     attempt - 1,
+				TotalLatency: time.Since(startTotal),
+				Diagnostics:  diagnostics,
+			}, &HTTPError{Category: "timeout"}
+		}
+
+		attemptStart := time.Now()
+		resp, httpErr := c.doSingleRequest(ctx, input)
+		duration := time.Since(attemptStart)
+
+		diag := AttemptDiagnostic{
+			Attempt:    attempt,
+			DurationMs: duration.Milliseconds(),
+		}
+
+		if httpErr == nil {
+			resp.Attempts = attempt
+			resp.RequestLatency = duration
+			resp.TotalLatency = time.Since(startTotal)
+			diag.StatusCode = 200
+			diag.Category = "success"
+			diagnostics = append(diagnostics, diag)
+			resp.Diagnostics = diagnostics
+			return resp, nil
+		}
+
+		lastErr = httpErr
+		diag.StatusCode = httpErr.StatusCode
+		diag.Category = httpErr.Category
+		diag.Error = httpErr.SafeMessage()
+
+		// Determine if retryable and not at max attempts
+		retryable := IsRetryable(httpErr.StatusCode, httpErr) && attempt < maxAttempts
+		diag.Retryable = &retryable
+		if !retryable {
+			diagnostics = append(diagnostics, diag)
+			break
+		}
+
+		// Calculate jittered delay, taking into account Retry-After
+		delay := c.retry.ComputeDelay(attempt, httpErr.RetryAfter)
+		diag.RetryDelayMs = delay.Milliseconds()
+		diagnostics = append(diagnostics, diag)
+
+		// Context-aware sleep
+		sleeper := c.retry.Sleeper
+		if sleeper == nil {
+			sleeper = defaultSleep
+		}
+		if sleepErr := sleeper(ctx, delay); sleepErr != nil {
+			return CompletionResponse{
+				Attempts:     attempt,
+				TotalLatency: time.Since(startTotal),
+				Diagnostics:  diagnostics,
+			}, &HTTPError{Category: "timeout"}
+		}
+	}
+
+	return CompletionResponse{
+		Attempts:     len(diagnostics),
+		TotalLatency: time.Since(startTotal),
+		Diagnostics:  diagnostics,
+	}, lastErr
+}
+
+func (c *HTTPClient) doSingleRequest(ctx context.Context, input CompletionRequest) (CompletionResponse, *HTTPError) {
 	requestBody := struct {
 		Model               string           `json:"model"`
 		Messages            []Message        `json:"messages"`
@@ -97,14 +206,29 @@ func (c *HTTPClient) Complete(ctx context.Context, input CompletionRequest) (Com
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+c.apiKey)
-	response, err := c.client.Do(request)
+
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if c.timeout > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	request = request.WithContext(reqCtx)
+
+	response, err := c.transport.RoundTrip(request)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 			return CompletionResponse{}, &HTTPError{Category: "timeout"}
+		}
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(reqCtx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+			return CompletionResponse{}, &HTTPError{Category: "context_cancelled"}
 		}
 		return CompletionResponse{}, &HTTPError{Category: "network_error"}
 	}
 	defer response.Body.Close()
+
+	retryAfter := ParseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		category := "api_error"
 		switch response.StatusCode {
@@ -117,7 +241,7 @@ func (c *HTTPClient) Complete(ctx context.Context, input CompletionRequest) (Com
 				category = "provider_server_error"
 			}
 		}
-		return CompletionResponse{}, &HTTPError{Category: category, StatusCode: response.StatusCode}
+		return CompletionResponse{}, &HTTPError{Category: category, StatusCode: response.StatusCode, RetryAfter: retryAfter}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxProviderResponseBytes+1))
@@ -133,6 +257,11 @@ func (c *HTTPClient) Complete(ctx context.Context, input CompletionRequest) (Com
 				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &decoded); err != nil || len(decoded.Choices) != 1 || decoded.Choices[0].Message.Role != "assistant" {
 		return CompletionResponse{}, &HTTPError{Category: "malformed_response"}
@@ -142,7 +271,23 @@ func (c *HTTPClient) Complete(ctx context.Context, input CompletionRequest) (Com
 	if choice.Message.Content != nil {
 		content = *choice.Message.Content
 	}
-	return CompletionResponse{Content: content, ToolCalls: choice.Message.ToolCalls, FinishReason: choice.FinishReason}, nil
+
+	usage := Usage{Available: false}
+	if decoded.Usage != nil {
+		usage = Usage{
+			PromptTokens:     decoded.Usage.PromptTokens,
+			CompletionTokens: decoded.Usage.CompletionTokens,
+			TotalTokens:      decoded.Usage.TotalTokens,
+			Available:        true,
+		}
+	}
+
+	return CompletionResponse{
+		Content:      content,
+		ToolCalls:    choice.Message.ToolCalls,
+		FinishReason: choice.FinishReason,
+		Usage:        usage,
+	}, nil
 }
 
 func isLoopback(host string) bool {

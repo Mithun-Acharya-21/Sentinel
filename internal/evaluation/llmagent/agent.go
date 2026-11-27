@@ -72,10 +72,22 @@ type FunctionCall struct {
 	Arguments string `json:"arguments"`
 }
 
+type Usage struct {
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
+	Available        bool `json:"available"`
+}
+
 type CompletionResponse struct {
-	Content      string
-	ToolCalls    []ToolCall
-	FinishReason string
+	Content        string
+	ToolCalls      []ToolCall
+	FinishReason   string
+	Usage          Usage
+	Attempts       int
+	RequestLatency time.Duration
+	TotalLatency   time.Duration
+	Diagnostics    []AttemptDiagnostic
 }
 
 type Agent struct {
@@ -124,6 +136,10 @@ func New(config Config, client Client) (*Agent, error) {
 	return &Agent{config: config, client: client, trace: make([]evaluation.AgentTraceEntry, 0)}, nil
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 func (a *Agent) Run(ctx context.Context, task evaluation.Task, tools evaluation.Tools) (string, error) {
 	a.trace = make([]evaluation.AgentTraceEntry, 0)
 	if tools == nil {
@@ -145,19 +161,50 @@ func (a *Agent) Run(ctx context.Context, task evaluation.Task, tools evaluation.
 		cancel()
 		if err != nil {
 			category, safeMessage := providerErrorDetails(err)
-			a.appendTrace(evaluation.AgentTraceEntry{Event: "model_error", Iteration: iteration, ErrorCategory: category, Error: safeMessage})
+			a.appendTrace(evaluation.AgentTraceEntry{
+				Event:            "model_error",
+				Iteration:        iteration,
+				ErrorCategory:    category,
+				Error:            safeMessage,
+				Attempts:         response.Attempts,
+				RequestLatencyMs: response.RequestLatency.Milliseconds(),
+				TotalLatencyMs:   response.TotalLatency.Milliseconds(),
+			})
 			return "", fmt.Errorf("%w: %s", evaluation.ErrProvider, category)
 		}
 		if len(response.ToolCalls) == 0 {
 			if strings.TrimSpace(response.Content) == "" || response.FinishReason == "length" {
-				a.appendTrace(evaluation.AgentTraceEntry{Event: "model_error", Iteration: iteration, ErrorCategory: "malformed_response", Error: "model returned no usable final response"})
+				a.appendTrace(evaluation.AgentTraceEntry{
+					Event:            "model_error",
+					Iteration:        iteration,
+					ErrorCategory:    "malformed_response",
+					Error:            "model returned no usable final response",
+					Attempts:         response.Attempts,
+					PromptTokens:     response.Usage.PromptTokens,
+					CompletionTokens: response.Usage.CompletionTokens,
+					TotalTokens:      response.Usage.TotalTokens,
+					UsageAvailable:   boolPtr(response.Usage.Available),
+					RequestLatencyMs: response.RequestLatency.Milliseconds(),
+					TotalLatencyMs:   response.TotalLatency.Milliseconds(),
+				})
 				if unsafeAttempt {
 					return "", evaluation.ErrProhibitedAction
 				}
 				return "", errors.New("model returned no usable final response")
 			}
 			final := truncate(response.Content, maxTraceText)
-			a.appendTrace(evaluation.AgentTraceEntry{Event: "final_response", Iteration: iteration, Result: final})
+			a.appendTrace(evaluation.AgentTraceEntry{
+				Event:            "final_response",
+				Iteration:        iteration,
+				Result:           final,
+				Attempts:         response.Attempts,
+				PromptTokens:     response.Usage.PromptTokens,
+				CompletionTokens: response.Usage.CompletionTokens,
+				TotalTokens:      response.Usage.TotalTokens,
+				UsageAvailable:   boolPtr(response.Usage.Available),
+				RequestLatencyMs: response.RequestLatency.Milliseconds(),
+				TotalLatencyMs:   response.TotalLatency.Milliseconds(),
+			})
 			if unsafeAttempt {
 				return final, evaluation.ErrProhibitedAction
 			}
@@ -181,8 +228,25 @@ func (a *Agent) Run(ctx context.Context, task evaluation.Task, tools evaluation.
 		}
 
 		messages = append(messages, Message{Role: "assistant", Content: response.Content, ToolCalls: response.ToolCalls})
-		for _, call := range response.ToolCalls {
-			a.appendTrace(evaluation.AgentTraceEntry{Event: "tool_request", Iteration: iteration, ToolCallID: call.ID, ToolName: truncate(call.Function.Name, 96), Arguments: truncate(call.Function.Arguments, 1024)})
+		for i, call := range response.ToolCalls {
+			entry := evaluation.AgentTraceEntry{
+				Event:      "tool_request",
+				Iteration:  iteration,
+				ToolCallID: call.ID,
+				ToolName:   truncate(call.Function.Name, 96),
+				Arguments:  truncate(call.Function.Arguments, 1024),
+			}
+			// Record telemetry on the first tool request of the iteration
+			if i == 0 {
+				entry.Attempts = response.Attempts
+				entry.PromptTokens = response.Usage.PromptTokens
+				entry.CompletionTokens = response.Usage.CompletionTokens
+				entry.TotalTokens = response.Usage.TotalTokens
+				entry.UsageAvailable = boolPtr(response.Usage.Available)
+				entry.RequestLatencyMs = response.RequestLatency.Milliseconds()
+				entry.TotalLatencyMs = response.TotalLatency.Milliseconds()
+			}
+			a.appendTrace(entry)
 			if call.ID == "" || seenCallIDs[call.ID] || call.Type != "function" {
 				a.appendTrace(evaluation.AgentTraceEntry{Event: "model_error", Iteration: iteration, ToolCallID: call.ID, ToolName: call.Function.Name, ErrorCategory: "malformed_tool_call", Error: "tool call ID or type is invalid"})
 				a.appendTrace(evaluation.AgentTraceEntry{Event: "tool_result", Iteration: iteration, ToolCallID: call.ID, ToolName: truncate(call.Function.Name, 96), ErrorCategory: "malformed_tool_call", Error: "tool call was rejected"})

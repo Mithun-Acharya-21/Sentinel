@@ -10,10 +10,21 @@ import (
 	"testing"
 	"time"
 
+	"sentinel/internal/auth"
 	"sentinel/internal/incident"
 )
 
 const testID = "4b1dd0c8-72aa-4a57-96ac-c5b46a5582ea"
+
+func testPrincipal(tenantID string) auth.Principal {
+	return auth.Principal{
+		PrincipalID:  "svc-test",
+		TenantID:     tenantID,
+		CredentialID: "cred-test-uuid",
+		Scopes:       []string{auth.ScopeIncidentsRead, auth.ScopeIncidentsWrite},
+		AuthMethod:   auth.AuthMethodBearerAPIKey,
+	}
+}
 
 type fakeRepository struct {
 	created      incident.Incident
@@ -23,6 +34,7 @@ type fakeRepository struct {
 	getErr       error
 	createCalls  int
 	getCalls     int
+	lastTenantID string
 	lastInput    incident.CreateInput
 	lastContext  context.Context
 }
@@ -34,8 +46,9 @@ func (f *fakeRepository) Create(ctx context.Context, input incident.CreateInput)
 	return f.created, f.createReplay, f.createErr
 }
 
-func (f *fakeRepository) Get(ctx context.Context, _ string) (incident.Incident, error) {
+func (f *fakeRepository) Get(ctx context.Context, tenantID, _ string) (incident.Incident, error) {
 	f.getCalls++
+	f.lastTenantID = tenantID
 	f.lastContext = ctx
 	return f.got, f.getErr
 }
@@ -45,6 +58,7 @@ func TestCreateIncidentReturnsCreatedRecordAndUsesRequestContext(t *testing.T) {
 	repo := &fakeRepository{created: want}
 	handler := New(repo)
 	ctx := context.WithValue(context.Background(), struct{}{}, "request-context")
+	ctx = auth.WithPrincipal(ctx, testPrincipal("tenant-demo"))
 	req := httptest.NewRequest(http.MethodPost, "/v1/incidents", strings.NewReader(sampleJSON()))
 	req = req.WithContext(ctx)
 	response := httptest.NewRecorder()
@@ -186,6 +200,7 @@ func TestGetIncidentMapsNotFoundUnavailableAndInvalidID(t *testing.T) {
 func serve(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request = request.WithContext(auth.WithPrincipal(request.Context(), testPrincipal("tenant-demo")))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
