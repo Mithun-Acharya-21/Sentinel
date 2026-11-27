@@ -1,6 +1,7 @@
 # Sentinel Observability Guide
 
-**Endpoint:** `GET /metrics` (Prometheus text exposition format `0.0.4`)  
+**Endpoint:** `GET /metrics` (Prometheus text exposition format `0.0.4`)
+
 **Health Probes:** `GET /health/live` (liveness), `GET /health/ready` (readiness)
 
 > **Security Note:** `/metrics` is exempt from API tenant authentication and rate limiting so Prometheus scrapers can collect telemetry reliably. Restrict `/metrics` access to internal monitoring networks at the ingress/load-balancer layer. No tenant IDs, incident IDs, job IDs, API keys, or client IPs are ever emitted as metric labels.

@@ -1,6 +1,7 @@
 # Sentinel Controlled Remediation Architecture
 
-**Date:** 2026-11-27  
+**Date:** 2026-11-27
+
 **Branch:** `portfolio-transformation`
 
 ---
@@ -44,7 +45,8 @@ stateDiagram-v2
 
 ## 3. At-Least-Once Execution & Crash Recovery
 
-PostgreSQL transactions fence `ClaimExecution` and `CompleteExecution` via `execution_token`, and **never** remain open during `Simulator.Apply`.  
+PostgreSQL transactions fence `ClaimExecution` and `CompleteExecution` via `execution_token`, and **never** remain open during `Simulator.Apply`.
+
 **Remaining Crash Window:** If the process crashes *after* `Simulator.Apply` mutates state and *before* `CompleteExecution` commits `succeeded`, the row remains `executing` until `lease_expires_at` passes, after which a retry reclaims the lease. Therefore Sentinel provides **at-least-once** execution with idempotent/precondition-checked actions, not distributed two-phase commit.
 
 ---

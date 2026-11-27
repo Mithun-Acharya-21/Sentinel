@@ -1,6 +1,7 @@
 # Sentinel — Milestone 3C: LLM-Powered Incident Triage & Human Approval
 
-**Date:** 2026-11-27  
+**Date:** 2026-11-27
+
 **Branch:** `portfolio-transformation`
 
 ---

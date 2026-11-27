@@ -1,7 +1,9 @@
 # Sentinel HTTP API Reference
 
-**Base URL:** `http://127.0.0.1:8080`  
-**Authentication:** `Authorization: Bearer snt_<16-hex-key-id>_<secret>` (required on all `/v1/*` routes)  
+**Base URL:** `http://127.0.0.1:8080`
+
+**Authentication:** `Authorization: Bearer snt_<16-hex-key-id>_<secret>` (required on all `/v1/*` routes)
+
 **Content-Type:** `application/json`
 
 ---
