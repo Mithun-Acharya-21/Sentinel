@@ -179,10 +179,10 @@ func TestAuthenticationAndAuthorizationBoundaries(t *testing.T) {
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body)
 		}
-		if repo.lastInput.TenantID != "tenant-demo" {
-			t.Fatalf("repo.lastInput.TenantID = %q, want tenant-demo", repo.lastInput.TenantID)
+		if repo.LastInput().TenantID != "tenant-demo" {
+			t.Fatalf("repo.LastInput().TenantID = %q, want tenant-demo", repo.LastInput().TenantID)
 		}
-		p, ok := auth.PrincipalFromContext(repo.lastContext)
+		p, ok := auth.PrincipalFromContext(repo.LastContext())
 		if !ok || p.PrincipalID != "svc-demo" || p.TenantID != "tenant-demo" {
 			t.Fatalf("principal not propagated to repository context: %#v (ok=%v)", p, ok)
 		}
@@ -251,15 +251,15 @@ func TestTenantIsolationAndSubstitutionAttacks(t *testing.T) {
 
 	t.Run("CrossTenantIncidentAccessScopedToAuthenticatedTenant", func(t *testing.T) {
 		// Simulate repository returning ErrNotFound when tenant-b queries tenant-a's incident ID.
-		repo.getErr = incident.ErrNotFound
+		repo.SetGetErr(incident.ErrNotFound)
 		req := httptest.NewRequest(http.MethodGet, "/v1/incidents/"+testID, nil)
 		req.Header.Set("Authorization", "Bearer "+tenantBKey.PlaintextToken)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
 		assertError(t, rec, http.StatusNotFound, "not_found")
-		if repo.lastTenantID != "tenant-b" {
-			t.Fatalf("repository Get called with tenantID = %q, want tenant-b", repo.lastTenantID)
+		if repo.LastTenantID() != "tenant-b" {
+			t.Fatalf("repository Get called with tenantID = %q, want tenant-b", repo.LastTenantID())
 		}
 	})
 }

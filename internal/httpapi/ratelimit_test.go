@@ -482,12 +482,12 @@ func TestRateLimiterWithIncidentIdempotency(t *testing.T) {
 	if rec1.Code != http.StatusCreated {
 		t.Fatalf("req1 status = %d, want 201", rec1.Code)
 	}
-	if repo.createCalls != 1 {
-		t.Fatalf("repo.createCalls = %d, want 1", repo.createCalls)
+	if repo.CreateCalls() != 1 {
+		t.Fatalf("repo.CreateCalls() = %d, want 1", repo.CreateCalls())
 	}
 
 	// 2. Idempotent replay (allowed, consumes 2nd token)
-	repo.createReplay = true
+	repo.SetCreateReplay(true)
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/incidents", strings.NewReader(sampleJSON()))
 	req2 = req2.WithContext(auth.WithPrincipal(req2.Context(), testPrincipal("tenant-demo")))
 	req2.RemoteAddr = clientAddr
@@ -496,8 +496,8 @@ func TestRateLimiterWithIncidentIdempotency(t *testing.T) {
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("req2 status = %d, want 200", rec2.Code)
 	}
-	if repo.createCalls != 2 {
-		t.Fatalf("repo.createCalls = %d, want 2", repo.createCalls)
+	if repo.CreateCalls() != 2 {
+		t.Fatalf("repo.CreateCalls() = %d, want 2", repo.CreateCalls())
 	}
 
 	// 3. 3rd request should be rejected by rate limiter WITHOUT invoking repository
@@ -510,9 +510,9 @@ func TestRateLimiterWithIncidentIdempotency(t *testing.T) {
 	if rec3.Code != http.StatusTooManyRequests {
 		t.Fatalf("req3 status = %d, want 429", rec3.Code)
 	}
-	// Repository createCalls must remain 2 (storage was protected from unneeded query)
-	if repo.createCalls != 2 {
-		t.Fatalf("repo.createCalls = %d, want 2 (repository should not be invoked when throttled)", repo.createCalls)
+	// Repository CreateCalls must remain 2 (storage was protected from unneeded query)
+	if repo.CreateCalls() != 2 {
+		t.Fatalf("repo.CreateCalls() = %d, want 2 (repository should not be invoked when throttled)", repo.CreateCalls())
 	}
 }
 
