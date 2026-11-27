@@ -261,8 +261,8 @@ func TestVerifierOutageReturns503AndFailsClosed(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	assertError(t, rec, http.StatusServiceUnavailable, "auth_unavailable")
-	if repo.getCalls != 0 {
-		t.Fatalf("repo.getCalls = %d, want 0 (handler must not run on verifier outage)", repo.getCalls)
+	if repo.GetCalls() != 0 {
+		t.Fatalf("repo.GetCalls() = %d, want 0 (handler must not run on verifier outage)", repo.GetCalls())
 	}
 }
 

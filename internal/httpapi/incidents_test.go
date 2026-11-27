@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ func testPrincipal(tenantID string) auth.Principal {
 }
 
 type fakeRepository struct {
+	mu           sync.RWMutex
 	created      incident.Incident
 	createReplay bool
 	createErr    error
@@ -40,6 +42,8 @@ type fakeRepository struct {
 }
 
 func (f *fakeRepository) Create(ctx context.Context, input incident.CreateInput) (incident.Incident, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.createCalls++
 	f.lastInput = input
 	f.lastContext = ctx
@@ -47,10 +51,54 @@ func (f *fakeRepository) Create(ctx context.Context, input incident.CreateInput)
 }
 
 func (f *fakeRepository) Get(ctx context.Context, tenantID, _ string) (incident.Incident, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.getCalls++
 	f.lastTenantID = tenantID
 	f.lastContext = ctx
 	return f.got, f.getErr
+}
+
+func (f *fakeRepository) CreateCalls() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.createCalls
+}
+
+func (f *fakeRepository) GetCalls() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.getCalls
+}
+
+func (f *fakeRepository) LastTenantID() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.lastTenantID
+}
+
+func (f *fakeRepository) LastInput() incident.CreateInput {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.lastInput
+}
+
+func (f *fakeRepository) LastContext() context.Context {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.lastContext
+}
+
+func (f *fakeRepository) SetCreateReplay(replay bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createReplay = replay
+}
+
+func (f *fakeRepository) SetGetErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getErr = err
 }
 
 func TestCreateIncidentReturnsCreatedRecordAndUsesRequestContext(t *testing.T) {
@@ -71,7 +119,7 @@ func TestCreateIncidentReturnsCreatedRecordAndUsesRequestContext(t *testing.T) {
 	if response.Header().Get("Location") != "/v1/incidents/"+testID {
 		t.Fatalf("Location = %q", response.Header().Get("Location"))
 	}
-	if repo.lastContext.Value(struct{}{}) != "request-context" {
+	if repo.LastContext().Value(struct{}{}) != "request-context" {
 		t.Fatal("request context was not passed to repository")
 	}
 	var body createResponse
@@ -81,8 +129,8 @@ func TestCreateIncidentReturnsCreatedRecordAndUsesRequestContext(t *testing.T) {
 	if body.Incident.ID != want.ID || body.IdempotentReplay {
 		t.Fatalf("response = %#v", body)
 	}
-	if repo.lastInput.TenantID != "tenant-demo" {
-		t.Fatalf("repository input tenant_id = %q", repo.lastInput.TenantID)
+	if repo.LastInput().TenantID != "tenant-demo" {
+		t.Fatalf("repository input tenant_id = %q", repo.LastInput().TenantID)
 	}
 }
 
@@ -118,7 +166,7 @@ func TestCreateIncidentRejectsMalformedAndInvalidRequests(t *testing.T) {
 			repo := &fakeRepository{created: sampleIncident()}
 			response := serve(t, New(repo), http.MethodPost, "/v1/incidents", tt.body)
 			assertError(t, response, http.StatusBadRequest, "invalid_request")
-			if repo.createCalls != 0 {
+			if repo.CreateCalls() != 0 {
 				t.Fatal("invalid request reached repository")
 			}
 		})
@@ -129,7 +177,7 @@ func TestCreateIncidentRejectsOversizedBody(t *testing.T) {
 	repo := &fakeRepository{}
 	response := serve(t, New(repo), http.MethodPost, "/v1/incidents", strings.Repeat("x", maxRequestBody+1))
 	assertError(t, response, http.StatusBadRequest, "invalid_request")
-	if repo.createCalls != 0 {
+	if repo.CreateCalls() != 0 {
 		t.Fatal("oversized request reached repository")
 	}
 }
@@ -190,7 +238,7 @@ func TestGetIncidentMapsNotFoundUnavailableAndInvalidID(t *testing.T) {
 			repo := &fakeRepository{getErr: tt.err}
 			response := serve(t, New(repo), http.MethodGet, tt.path, "")
 			assertError(t, response, tt.status, tt.code)
-			if tt.name == "bad UUID" && repo.getCalls != 0 {
+			if tt.name == "bad UUID" && repo.GetCalls() != 0 {
 				t.Fatal("invalid ID reached repository")
 			}
 		})
